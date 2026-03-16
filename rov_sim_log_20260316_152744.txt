@@ -1,0 +1,110 @@
+ROV Simulator Log - 2026-03-16 15:27:44
+================================================================================
+
+📝 Logging to: /Users/connor/Downloads/rov_custom_sim/rov_sim_log_20260316_152744.txt
+[CONFIG] Selected: Configuration V2
+[CONFIG]   OBJ:  /Users/connor/Downloads/rov_custom_sim/v2.obj
+[CONFIG]   GLTF: /Users/connor/Downloads/rov_custom_sim/v2.gltf
+[ENV] Pool environment created: 6m × 4m × 3.2m deep
+[ENV] 3 riser pipes with inspection stripes
+[ENV] Grid lines, depth markers added
+Mesh bounds size (m): 0.480 x 0.520 x 0.334
+Collision box half-extents (m): 0.240, 0.260, 0.167
+Body rotation applied (deg r,p,y): (0.0, 0.0, 90.0)
+[AUTO] Thrusters detected from GLTF:
+    {'name': 'thruster_1', 'pos': (-0.08851201490041986, 0.12827537977228165, -0.009382605545845024), 'dir': (-0.29350754603183193, -0.955956756565051, 7.708980116863054e-10), 'key': 49, 'kind': 'H'}
+    {'name': 'thruster_2', 'pos': (0.2096490699214935, 0.12474889704117775, -0.009050399058189385), 'dir': (0.3007057962135454, -0.9537169517857894, 4.530426412839232e-13), 'key': 50, 'kind': 'H'}
+    {'name': 'thruster_3', 'pos': (0.06571818770599365, -0.005930907790565487, -0.0287434011629486), 'dir': (-0.0002980298221175357, 0.0043361330124396915, 0.9999905545197532), 'key': 51, 'kind': 'V'}
+    {'name': 'thruster_4', 'pos': (0.06345459701251983, -0.255790583555603, -0.006025597446289055), 'dir': (9.233591370607538e-05, -0.999990550255138, 0.0043463633655048016), 'key': 52, 'kind': 'H'}
+[CAM] Using camera pose from GLTF: pos=(0.062, -0.344, -0.109), fwd=(0.0, -1.0, 0.0), up=(0.0, 0.0, 1.0)
+[CAM] Servo tilt range: -90° .. 90°
+[THR] Created 4 thruster indicators (free-standing, repositioned each frame)
+[JOYSTICK] Virtual joystick panel opened
+
+🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 
+╔════════════════════════════════════════════════════════════════════╗
+║          CTRL+SEA ROV SIMULATOR — PyBullet Physics Engine          ║
+╚════════════════════════════════════════════════════════════════════╝
+
+────────────────────────────────────────────────────────────────────────
+📋 COMPLETE KEYBOARD CONTROLS
+────────────────────────────────────────────────────────────────────────
+
+🔧 THRUSTER CONTROL:
+  [1-4]        Toggle Thruster 1-4 ON (forward) / OFF
+  [5-8]        Toggle Thruster 1-4 ON (reverse) / OFF
+  [Z/X/C/V]   Toggle Reverse mode for Thrusters 1-4
+  [+]/[-]      Increase/decrease thrust power level
+               Thruster 1-3: Horizontal | Thruster 4: Vertical (Heave)
+
+📷 CAMERA CONTROL:
+  [J]/[L]      Yaw camera left/right
+  [I]/[K]      Pitch camera up/down
+  [U]/[O]      Zoom camera in/out
+  [N]/[M]      Pan camera target up/down
+  [F]          Toggle camera follow mode (ON/OFF)
+
+🚧 OBSTACLE MANIPULATION:
+  [TAB]        Select next obstacle (cycles through all)
+  [W]/[A]/[S]/[D]  Move selected obstacle forward/left/back/right
+  [Q]/[E]      Move selected obstacle up/down (depth)
+  [X]          Reset selected obstacle to random position
+  [Mouse]      Click-drag obstacles with left mouse button
+
+⏮️  SIMULATION CONTROL:
+  [R]          Reset ROV to start position (faces obstacles)
+  [F]          Toggle camera follow mode (ON/OFF)
+  [G]          Toggle chase camera (auto-orbit behind ROV heading)
+  [T]          Toggle top-down view (bird's-eye looking straight down)
+  [0]          Emergency surface (full heave up, kill horizontals)
+  [ESC]        Quit simulator
+
+🎮 CONTROLLER PANEL (separate window):
+  Left stick — 8 angular zones (45° each):
+    ↑ Fwd (T4)  ↗ Fwd+Yaw-R (T4+T1−T2)  → Yaw-R (T1−T2)
+    ↘ Rev+Yaw-R (T4+T1−T2)  ↓ Rev (T4)  ↙ Rev+Yaw-L (T4+T1−T2)
+    ← Yaw-L (T1−T2)  ↖ Fwd+Yaw-L (T4+T1−T2)
+  Right stick: ↑↓ Camera pitch (servo tilt)  ←→ Yaw (T1−T2)
+  Thrusters are ON/OFF only (100% power)
+  Direction switch cooldown: 0.5s
+
+⚙️  PHYSICS ENGINE:
+  Timestep: 8.3ms (120 Hz)  │  Mass: 7.5 kg  │  Gravity: 9.81 m/s²
+  Limits: Speed 1.5m/s  │  Rotation 4.0rad/s
+  Thrust: Horizontal 5.56N  │  Vertical 5.56N
+
+💧 HYDRODYNAMICS:
+  Buoyancy: 1.04× weight @ (0.0, 0.0, 0.08)  │  Ballast: 0.04× @ (0.0, 0.0, -0.1)
+  Righting: Kp=3.0  Kd=2.5
+  Drag: ρ=998.0kg/m³  │  Linear: (4.0, 5.0, 6.0)  │  CD/Area: [1.5, 1.5, 1.2]/[0.0929, 0.0929, 0.1238]
+  Added Mass: (7.5, 9.0, 10.0) kg
+  Ocean Current: base=(0.01, 0.005, 0.0)  var amp=(0.005, 0.003, 0.002)
+  Surface: z=1.2m  │  Seabed: z=-2.0m  │  Depth buoy compress: 0.001/m
+
+🎨 RENDERING:
+  📷 Camera 30fps (servo tilt -90°..90°)  → Arrows 60fps  
+
+🆕 NEW FEATURES:
+  ├─ Camera OSD (depth bar + heading)
+  ├─ Depth-dependent camera tint
+  ├─ Speed-dependent camera shake
+  ├─ Proximity warnings (<0.25m)
+  ├─ Collision detection feedback
+  ├─ Emergency surface [0] key
+  ├─ Chase camera [G] key
+  ├─ Top-down view [T] key
+  ├─ Dynamic thruster indicators (length scales with ramp)
+  ├─ Thruster efficiency readout in telemetry
+  └─ ⏺ Screen recording (REC button on controller panel)
+
+🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 🌊 
+
+[💥 COLLISION] body=13 force=8.6N pos=(+1.92,-0.01,+0.72)
+[💥 COLLISION] body=13 force=6.6N pos=(+1.92,+0.02,+0.72)
+
+[ERROR] Physics solver instability detected (getBaseVelocity failed).
+[HINT] Try: lowering MAX_THRUST_H/MAX_THRUST_V, increasing LIN_DRAG_ANG, or reducing MAX_OMEGA.
+
+
+================================================================================
+Simulation ended at 2026-03-16 15:28:13
