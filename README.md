@@ -121,6 +121,30 @@ Calibration tooling:
 
 These are mostly script-style diagnostics rather than strict assertion-heavy unit tests.
 
+## Verification Harness
+
+The repository now includes a structured debug harness under `debug/` for evidence-first verification.
+
+- `python -m debug.debug_full_system`: runs the full suite and writes a run folder under `debug_artifacts/`
+- `python -m debug.debug_startup_and_config`: startup, asset, config, and dependency preflight
+- `python -m debug.debug_thruster_geometry`: GLTF thruster vector/count/symmetry/yaw-sign checks
+- `python -m debug.debug_control_path`: shared-memory to mixer to cooldown to thrust trace capture
+- `python -m debug.debug_physics_sanity`: settle, surge, yaw, and heave qualitative sanity checks
+- `python -m debug.debug_physics_environment_stress`: adversarial command stress test across environment presets (NaN/instability bounds)
+- `python -m debug.debug_camera_recording_pipeline`: camera pose source, frame freshness, recording prerequisites, and recording file integrity probe
+- `python -m debug.debug_ui_truthfulness`: shared-memory/UI status mapping plus joystick, recording-status, and panel-frame roundtrip checks
+- `python -m debug.debug_ui_settings_contract`: settings menu slot wiring, range contracts, reset pulse semantics, and feedback-slot coverage
+- `python -m debug.debug_runtime_events_integrity`: validates env-gated JSONL runtime event emission and schema
+- `python -m debug.debug_recording_event_file_correlation`: validates recording start/stop events correlate to a real non-empty recording artifact path
+- `python -m debug.debug_runtime_consistency`: doc/runtime mismatch and stale-file risk checks
+
+Each module writes `results.json` and `results.md` in its own artifact folder, plus raw traces when relevant.
+
+Optional runtime event instrumentation can be enabled while running the simulator:
+
+- `ROV_DEBUG_EVENTS=1` enables JSONL event logs for simulator and panel lifecycle/state transitions
+- `ROV_DEBUG_EVENTS_FILE=/path/to/runtime_events.jsonl` overrides the output path
+
 ## Logs
 
 Every simulator run writes a timestamped log file in the workspace:

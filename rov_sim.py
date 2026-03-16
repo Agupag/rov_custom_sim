@@ -19,6 +19,11 @@ try:
 except ImportError:
     HAS_NUMPY = False
 
+try:
+    from debug.runtime_events import RuntimeEventLogger
+except ImportError:
+    RuntimeEventLogger = None
+
 import pybullet as p
 import pybullet_data
 
@@ -83,6 +88,7 @@ LOG_FILE = os.path.join(HERE, f"rov_sim_log_{datetime.now().strftime('%Y%m%d_%H%
 # Store original print and create logged version
 _original_print = print
 _log_file_handle = None
+_runtime_events = None
 
 def print(*args, **kwargs):
     """Print to both console and log file."""
@@ -95,6 +101,23 @@ def print(*args, **kwargs):
             # Don't flush every line — let the OS buffer handle it
     except (OSError, ValueError):
         # ValueError: I/O operation on closed file
+        pass
+
+
+def _init_runtime_events():
+    global _runtime_events
+    if RuntimeEventLogger is None:
+        _runtime_events = None
+        return
+    _runtime_events = RuntimeEventLogger.from_environment("rov_sim")
+
+
+def _evt(category, event, **fields):
+    if _runtime_events is None:
+        return
+    try:
+        _runtime_events.emit(category, event, **fields)
+    except (OSError, ValueError, TypeError):
         pass
 
 """
@@ -2636,6 +2659,9 @@ def main():
     global DEPTH_HOLD_ENABLED, DEPTH_HOLD_TARGET, HEADING_HOLD_ENABLED, HEADING_HOLD_TARGET
     global PROPORTIONAL_MODE, THRUSTER_FAILURE_ENABLED, THRUSTER_FAILED
     global SHOW_FORCE_VECTORS, ACTIVE_ENVIRONMENT, NUM_OBSTACLES
+
+    _init_runtime_events()
+    _evt("startup", "main_enter", data_dir=DATA_DIR, has_joystick=HAS_JOYSTICK)
     
     # Initialize log file
     try:
@@ -2667,16 +2693,20 @@ def main():
             sel = choose_thruster_config()
             if sel is None:
                 print("[CONFIG] No configuration selected — exiting.")
+                _evt("startup", "config_not_selected")
                 return
+            _evt("startup", "config_selected", selected=ACTIVE_CONFIG_NAME, obj=OBJ_FILE, gltf=GLTF_FILE)
         except (RuntimeError, ImportError) as e:
             print(f"⚠️  Tkinter selector crashed: {e}")
             print("[CONFIG] Using auto-fallback to first config.")
+            _evt("startup", "config_selector_failed", error=str(e))
             if THRUSTER_CONFIGS:
                 name = list(THRUSTER_CONFIGS.keys())[0]
                 OBJ_FILE  = THRUSTER_CONFIGS[name]["obj"]
                 GLTF_FILE = THRUSTER_CONFIGS[name]["gltf"]
                 ACTIVE_CONFIG_NAME = name
                 print(f"[CONFIG] Auto-selected: {name}")
+                _evt("startup", "config_auto_selected", selected=name, obj=OBJ_FILE, gltf=GLTF_FILE)
     else:
         if THRUSTER_CONFIGS:
             name = list(THRUSTER_CONFIGS.keys())[0]
@@ -2684,6 +2714,7 @@ def main():
             GLTF_FILE = THRUSTER_CONFIGS[name]["gltf"]
             ACTIVE_CONFIG_NAME = name
             print(f"[CONFIG] Auto-selected: {name}")
+            _evt("startup", "config_auto_selected", selected=name, obj=OBJ_FILE, gltf=GLTF_FILE)
 
     setup_pybullet()
 
@@ -2711,8 +2742,10 @@ def main():
             print("[AUTO] Thrusters detected from GLTF:")
             for t in THRUSTERS:
                 print("   ", t)
+            _evt("thrusters", "gltf_detect_success", gltf=GLTF_FILE, thruster_count=len(THRUSTERS))
         else:
             print("[AUTO] GLTF thruster detect failed; using fallback THRUSTERS.")
+            _evt("thrusters", "gltf_detect_fallback", gltf=GLTF_FILE, fallback_count=len(THRUSTERS))
 
     # ROV camera pose (BODY frame) from GLTF if possible
     cam_info = find_camera_pose_from_gltf(GLTF_FILE, mesh_center)
@@ -2722,11 +2755,20 @@ def main():
         cam_fwd_body = (1.0, 0.0, 0.0)
         cam_up_body = (0.0, 0.0, 1.0)
         print("[CAM] GLTF camera node not found; using fallback ROV camera pose.")
+        _evt("camera", "camera_pose_fallback", gltf=GLTF_FILE)
     else:
         cam_pos_body, cam_fwd_body, cam_up_body = cam_info
         print(f"[CAM] Using camera pose from GLTF: pos={tuple(round(x,3) for x in cam_pos_body)}, "
               f"fwd={tuple(round(x,3) for x in cam_fwd_body)}, up={tuple(round(x,3) for x in cam_up_body)}")
         print(f"[CAM] Servo tilt range: {CAMERA_SERVO_MIN_DEG:.0f}° .. {CAMERA_SERVO_MAX_DEG:.0f}°")
+        _evt(
+            "camera",
+            "camera_pose_from_gltf",
+            gltf=GLTF_FILE,
+            pos=[round(x, 4) for x in cam_pos_body],
+            fwd=[round(x, 4) for x in cam_fwd_body],
+            up=[round(x, 4) for x in cam_up_body],
+        )
 
     markers = make_markers(THRUSTERS)
 
@@ -3289,6 +3331,13 @@ def main():
                             # Still in cooldown — command zero (coast) instead
                             desired = 0.0
                             desired_sign = 0
+                            _evt(
+                                "control",
+                                "cooldown_block",
+                                thruster=i + 1,
+                                cooldown=JOYSTICK_SWITCH_COOLDOWN,
+                                elapsed=round(_now - _js_last_switch_t[i], 4),
+                            )
                         else:
                             _js_last_switch_t[i] = _now
                     elif desired_sign != _js_last_sign[i]:
@@ -3368,6 +3417,7 @@ def main():
                 _set_emergency = _emergency_surface_active
                 _set_reset_cmd = _panel_last_reset_cmd
                 _set_trail = TRAIL_ENABLED
+                _evt("control", "panel_settings_read_error")
 
             THRUST_LEVEL = clamp(float(_set_thrust), 0.1, 1.0)
 
@@ -3745,6 +3795,7 @@ def main():
                         joystick_panel._shared[REC_STATUS] = REC_STATUS_MISSING_DEPS
                 except (IndexError, ValueError, OSError):
                     pass
+                _evt("recording", "start_failed_missing_deps", has_cv2=cv2 is not None, has_numpy=HAS_NUMPY)
             else:
                 try:
                     with joystick_panel._shared.get_lock():
@@ -3766,6 +3817,7 @@ def main():
                     print(f"[REC] ⏺  Recording started → {_rec_path}")
                     print(f"[REC]    Output: {_rec_out_w}×{_rec_out_h} @ {REC_FPS}fps")
                     print(f"[REC]    Layout: [3D view {REC_3D_W}×{REC_3D_H} | Controller {_PANEL_W}×{_PANEL_H}]")
+                    _evt("recording", "start_ok", path=_rec_path, out_w=_rec_out_w, out_h=_rec_out_h, fps=REC_FPS)
                 else:
                     print(f"[REC] ⚠️  Failed to open video writer for {_rec_path}")
                     _rec_writer = None
@@ -3775,6 +3827,7 @@ def main():
                             joystick_panel._shared[REC_STATUS] = REC_STATUS_WRITER_OPEN_FAILED
                     except (IndexError, ValueError, OSError):
                         pass
+                    _evt("recording", "start_failed_writer_open", path=_rec_path)
 
         elif _rec_active and not _rec_want:
             # --- STOP recording ---
@@ -3783,6 +3836,7 @@ def main():
                 _dur = _rec_frame_count / max(1, REC_FPS)
                 print(f"[REC] ⏹  Recording saved: {_rec_path}")
                 print(f"[REC]    {_rec_frame_count} frames, ~{_dur:.1f}s duration")
+                _evt("recording", "stop_ok", path=_rec_path, frames=_rec_frame_count, duration_s=round(_dur, 3))
                 _rec_writer = None
             try:
                 with joystick_panel._shared.get_lock():
@@ -3858,6 +3912,7 @@ def main():
                 # Don't crash the sim if recording fails
                 if _rec_frame_count == 0:
                     print(f"[REC] ⚠️  Frame capture error: {_rec_err}")
+                _evt("recording", "frame_write_error", error=str(_rec_err), frame_count=_rec_frame_count)
                 try:
                     with joystick_panel._shared.get_lock():
                         joystick_panel._shared[REC_STATUS] = REC_STATUS_FRAME_WRITE_FAILED

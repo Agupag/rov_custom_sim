@@ -55,6 +55,11 @@ import time
 import sys
 import os
 
+try:
+    from debug.runtime_events import RuntimeEventLogger
+except ImportError:
+    RuntimeEventLogger = None
+
 from sim_shared import (
     ACTIVE,
     CAM_TILT,
@@ -113,6 +118,24 @@ _frame_seq = None   # multiprocessing.Value('i')
 _panel_buf = None   # multiprocessing.RawArray('B', _PANEL_NBYTES) — full controller screenshot
 _panel_seq = None   # multiprocessing.Value('i')
 _process = None
+_runtime_events = None
+
+
+def _init_runtime_events():
+    global _runtime_events
+    if RuntimeEventLogger is None:
+        _runtime_events = None
+        return
+    _runtime_events = RuntimeEventLogger.from_environment("joystick_panel")
+
+
+def _evt(category, event, **fields):
+    if _runtime_events is None:
+        return
+    try:
+        _runtime_events.emit(category, event, **fields)
+    except (OSError, ValueError, TypeError):
+        pass
 
 
 def _ensure_shared():
@@ -134,6 +157,7 @@ def _ensure_shared():
         _panel_buf = multiprocessing.RawArray(ctypes.c_uint8, _PANEL_NBYTES)
     if _panel_seq is None:
         _panel_seq = multiprocessing.Value(ctypes.c_int, 0, lock=True)
+    _evt("ipc", "shared_ready", slots=SHARED_SLOT_COUNT)
 
 
 def get_joystick_state():
@@ -152,6 +176,7 @@ def get_joystick_state():
                 "cam_tilt": _shared[CAM_TILT],
             }
     except Exception:
+        _evt("ipc", "get_joystick_state_error")
         return {"surge": 0.0, "sway": 0.0, "heave": 0.0, "yaw": 0.0,
                 "active": False, "cam_tilt": 0.0}
 
@@ -164,6 +189,8 @@ def push_camera_frame(rgb_bytes):
     ctypes.memmove(ctypes.addressof(_frame_buf), rgb_bytes, n)
     with _frame_seq.get_lock():
         _frame_seq.value += 1
+        if (_frame_seq.value % 120) == 0:
+            _evt("camera", "frame_seq_tick", frame_seq=int(_frame_seq.value))
 
 
 def is_recording():
@@ -193,6 +220,7 @@ def get_panel_frame():
         raw = bytes(_panel_buf)
         return seq, raw
     except Exception:
+        _evt("camera", "get_panel_frame_error")
         return 0, None
 
 
@@ -204,6 +232,7 @@ def get_recording_status():
         with _shared.get_lock():
             return _shared[REC_STATUS]
     except Exception:
+        _evt("recording", "get_recording_status_error")
         return REC_STATUS_OK
 
 
@@ -1089,6 +1118,7 @@ def start_joystick_panel():
     """Launch the joystick panel in a child process."""
     global _process, _shared
     _ensure_shared()
+    _init_runtime_events()
     if _process is not None and _process.is_alive():
         return
     _process = multiprocessing.Process(
@@ -1096,6 +1126,7 @@ def start_joystick_panel():
         args=(_shared, _frame_buf, _frame_seq, _panel_buf, _panel_seq),
         daemon=True, name="JoystickPanel")
     _process.start()
+    _evt("lifecycle", "panel_process_started", pid=int(_process.pid) if _process.pid else None)
     time.sleep(0.25)
 
 
@@ -1116,6 +1147,7 @@ def stop_joystick_panel():
         try:
             _process.terminate()
             _process.join(timeout=1.0)
+            _evt("lifecycle", "panel_process_stopped")
         except Exception:
             pass
         _process = None
