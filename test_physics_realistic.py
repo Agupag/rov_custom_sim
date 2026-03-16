@@ -380,6 +380,64 @@ def run():
             prev_speed = speed
             prev_t = t
 
+    # ── TEST 6: Timing and Latency Metrics ──
+    print(f"\n{'─'*72}")
+    print("  TEST 6: TIMING & LATENCY METRICS (physics loop performance)")
+    print(f"{'─'*72}")
+    
+    import time
+    
+    # Measure physics step latency
+    step_times = []
+    print(f"    Measuring 100 physics steps...")
+    reset_rov()
+    for _ in range(int(2.0 / DT)):  # Settle first
+        step_physics([0, 0, 0, 0], 1)
+    
+    for _ in range(100):
+        t_start = time.perf_counter()
+        base_pos, base_quat = p.getBasePositionAndOrientation(rov)
+        lin, ang = p.getBaseVelocity(rov)
+        
+        # Minimal physics for measurement
+        depth = max(0.0, rov_sim.SURFACE_Z - base_pos[2])
+        _hull_half_z = 0.15
+        submersion = min(1.0, max(0.0, depth / _hull_half_z)) if depth < _hull_half_z else 1.0
+        depth_buoyancy_factor = max(0.5, 1.0 - rov_sim.DEPTH_BUOYANCY_COMPRESSIBILITY * depth)
+        buoy_force = rov_sim.MASS * rov_sim.GRAVITY * rov_sim.BUOYANCY_SCALE * depth_buoyancy_factor * submersion
+        cob_rel_world = p.rotateVector(base_quat, rov_sim.COB_OFFSET_BODY)
+        cob_world = (base_pos[0]+cob_rel_world[0], base_pos[1]+cob_rel_world[1], base_pos[2]+cob_rel_world[2])
+        p.applyExternalForce(rov, -1, (0.0, 0.0, buoy_force), cob_world, p.WORLD_FRAME)
+        rov_sim.apply_ballast(rov, base_pos, base_quat)
+        if submersion > 0.01:
+            rov_sim.apply_righting_torque(rov, base_quat, ang, submersion)
+        rov_sim.apply_drag(rov, base_pos, base_quat, lin, ang)
+        
+        p.stepSimulation()
+        t_end = time.perf_counter()
+        step_times.append((t_end - t_start) * 1000.0)  # Convert to ms
+    
+    mean_step_time = sum(step_times) / len(step_times)
+    max_step_time = max(step_times)
+    min_step_time = min(step_times)
+    
+    # Calculate effective loop frequency
+    dt_measured = mean_step_time / 1000.0
+    expected_hz = 1.0 / DT
+    actual_hz = 1.0 / dt_measured if dt_measured > 0 else 0
+    speedup_factor = actual_hz / expected_hz if expected_hz > 0 else 0
+    
+    print(f"    Physics timestep (configured): {DT*1000:.2f} ms ({expected_hz:.1f} Hz)")
+    print(f"    Mean measured step time:       {mean_step_time:.3f} ms")
+    print(f"    Min step time:                 {min_step_time:.3f} ms")
+    print(f"    Max step time:                 {max_step_time:.3f} ms")
+    print(f"    Effective loop frequency:      {actual_hz:.1f} Hz ({speedup_factor:.1f}x realtime)")
+    print(f"    Consistency (stddev):          {(sum((x-mean_step_time)**2 for x in step_times)/len(step_times))**0.5:.3f} ms")
+    
+    results['physics_loop_hz'] = actual_hz
+    results['physics_step_ms'] = mean_step_time
+    results['physics_max_latency_ms'] = max_step_time
+
     # ── SUMMARY ──
     print(f"\n{'='*72}")
     print("  REALISM ASSESSMENT")
@@ -414,6 +472,16 @@ def run():
     # Heave
     status = "✅ GOOD" if 0.1 <= results['heave_max_speed'] <= 0.6 else "❌ BAD"
     print(f"  Heave max speed     {results['heave_max_speed']:.3f} m/s   0.2-0.4 m/s        {status}")
+    
+    # Timing metrics
+    print(f"\n  Metric              Current     Requirement      Status")
+    print(f"  {'─'*60}")
+    status = "✅ GOOD" if results['physics_loop_hz'] > 0.9 * (1.0 / DT) else "❌ BAD"
+    print(f"  Physics loop freq    {results['physics_loop_hz']:.1f} Hz      ≥ {1.0/DT:.0f} Hz         {status}")
+    status = "✅ GOOD" if results['physics_step_ms'] <= DT * 1000 * 1.2 else "❌ BAD"
+    print(f"  Mean step latency    {results['physics_step_ms']:.3f} ms     ≤ {DT*1000*1.2:.2f} ms      {status}")
+    status = "✅ GOOD" if results['physics_max_latency_ms'] <= DT * 1000 * 5.0 else "⚠️  CAUTION"
+    print(f"  Max step latency     {results['physics_max_latency_ms']:.3f} ms    ≤ {DT*1000*5.0:.2f} ms     {status}")
     
     print(f"\n  NOTE: DDR predicts ~0.4 m/s surge with 5.56N thrust, 7.5kg, CD=1.5, A=0.093m²")
     print(f"  Analytical terminal velocity: {v_terminal_analytical:.3f} m/s")

@@ -18,19 +18,28 @@ This workspace contains a PyBullet-based underwater ROV simulator with a separat
 
 The runtime is centered on `rov_sim.py`.
 
-- It builds the PyBullet world, loads the ROV mesh, detects thrusters from the GLTF, runs the hydrodynamics, applies thrust, renders the scene, logs telemetry, and handles keyboard control.
+- It builds the PyBullet world, loads the ROV mesh, detects thrusters from the GLTF, runs the hydrodynamics, applies thrust, renders the scene, logs telemetry, and applies runtime settings from the controller panel.
 - It uses a marine-vehicle style model with buoyancy, ballast, righting torque, linear and quadratic drag, added mass, added inertia, and added-mass Coriolis coupling.
 - Most force calculations are performed in the body frame and then rotated into the world frame before being applied to PyBullet.
 
 The controller UI is isolated in `joystick_panel.py`.
 
 - On macOS this separation matters because Tkinter and the PyBullet GUI both prefer main-thread ownership.
-- Shared memory carries joystick axes and camera frames between the two processes.
-- The joystick mixer is binary, not proportional: it outputs `-1`, `0`, or `+1` per thruster, and the perceived smoothness comes from thruster spool dynamics in `rov_sim.py`.
+- Shared memory carries joystick axes, telemetry, recording status, control mode, and camera frames between the two processes.
+- The joystick mixer is binary by default: it outputs `-1`, `0`, or `+1` per thruster, and the perceived smoothness comes from thruster spool dynamics in `rov_sim.py`.
+- A proportional path also exists for diagnostics and fine control experiments, but binary mode remains the default operator workflow.
+
+### Controller Panel UX
+
+- On-screen legend now shows quick controls for sticks, heave, recording, and close.
+- Status chips in the panel indicate control mode, assist state, and recording health with color-coded feedback.
+- Bottom telemetry remains depth, heading, speed, and thrust, and now pairs with clearer mode and recording labels.
+- The `SETTINGS` button opens a dedicated runtime settings window.
+- Simulator settings are controlled through this Tkinter settings window (not keyboard keys in the simulator).
 
 ## Control Flow
 
-1. The joystick panel writes `surge`, `yaw`, `heave`, and `cam_tilt` into shared memory.
+1. The joystick panel writes joystick axes and settings values into shared memory.
 2. `rov_sim.py` reads those values once per step.
 3. `joystick_panel.mix_joystick_to_thruster_cmds(...)` maps joystick intent to binary thruster commands.
 4. `rov_sim.py` applies per-thruster sign-change cooldown logic and first-order ramping.
@@ -95,13 +104,20 @@ There is also a convenience launcher for a conda environment named `rov_conda`:
 
 These scripts are the best guide to intended behavior.
 
-- `test_physics_realistic.py`: measures terminal speed, acceleration, stopping distance, yaw response, and vertical response
+- `test_extended_diagnostics.py`: validates depth hold, heading hold, GLTF thruster frame checks, and exports `extended_diagnostics_results.json`
+- `test_physics_realistic.py`: measures terminal speed, acceleration, stopping distance, yaw response, vertical response, and loop timing metrics
 - `test_sim_diagnostic.py`: verifies mixer output and end-to-end sign chain through real physics
 - `test_mixer_analysis.py`: decomposes thruster geometry and force or torque contributions
 - `test_physics_diag.py`: runs a timed headless diagnostic and writes `diag_physics.log`
 - `test_joystick.py`: checks mixer mapping, shared memory, cooldown logic, and integration behavior
 - `test_joystick_full.py`: runs a multi-phase joystick-driven headless scenario
-- `test_thruster_logic.py`: validates the reverse and on/off state machine without PyBullet
+- `test_thruster_logic.py`: validates the reverse and on or off state machine without PyBullet
+
+Calibration tooling:
+
+- `tools/run_sensitivity_sweep.py`: runs one-factor-at-a-time physics sensitivity sweeps and writes `tools/sensitivity_sweep_results.json` and `.csv`
+- `tools/analyze_sensitivity_recommendation.py`: scores sweep scenarios and writes recommendation JSON and Markdown outputs
+- `tools/run_validation_and_calibration.py`: one-command pipeline that runs diagnostics and calibration tooling and writes `tools/validation_pipeline_summary.json`
 
 These are mostly script-style diagnostics rather than strict assertion-heavy unit tests.
 

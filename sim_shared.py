@@ -1,0 +1,63 @@
+"""Shared-memory slot definitions and panel sizing for the simulator UI IPC."""
+
+SHARED_SLOT_COUNT = 32
+
+SURGE = 0
+SWAY = 1
+HEAVE = 2
+YAW = 3
+ACTIVE = 4
+CAM_TILT = 5
+ROLL_RAD = 6
+PITCH_RAD = 7
+REC_FLAG = 8
+DEPTH_M = 9
+HEADING_DEG = 10
+SPEED_MPS = 11
+THRUST_LEVEL = 12
+DEPTH_HOLD_ACTIVE = 13
+HEADING_HOLD_ACTIVE = 14
+REC_STATUS = 15
+CONTROL_MODE = 16
+SET_THRUST_LEVEL = 17
+SET_PROPORTIONAL_MODE = 18
+SET_DEPTH_HOLD = 19
+SET_HEADING_HOLD = 20
+SET_CAM_FOLLOW = 21
+SET_CAM_CHASE = 22
+SET_TOPDOWN = 23
+SET_SHOW_FORCE_VECTORS = 24
+SET_THRUSTER_FAILURE = 25
+SET_EMERGENCY_SURFACE = 26
+CMD_RESET_ROV = 27
+SET_TRAIL_ENABLED = 28
+
+RESERVED_SLOTS = (29, 30, 31)
+
+REC_STATUS_OK = 0.0
+REC_STATUS_MISSING_DEPS = 1.0
+REC_STATUS_WRITER_OPEN_FAILED = 2.0
+REC_STATUS_PANEL_CAPTURE_UNAVAILABLE = 3.0
+REC_STATUS_FRAME_WRITE_FAILED = 4.0
+
+CONTROL_MODE_BINARY = 0.0
+CONTROL_MODE_PROPORTIONAL = 1.0
+
+CTRL_W = 720
+CTRL_H = 480
+
+
+def control_mode_label(mode_value):
+    return "PROP" if mode_value > 0.5 else "BIN"
+
+
+def recording_status_label(status_value):
+    status_code = int(round(status_value))
+    labels = {
+        int(REC_STATUS_OK): "",
+        int(REC_STATUS_MISSING_DEPS): "REC DEPS",
+        int(REC_STATUS_WRITER_OPEN_FAILED): "REC OPEN",
+        int(REC_STATUS_PANEL_CAPTURE_UNAVAILABLE): "REC PANEL",
+        int(REC_STATUS_FRAME_WRITE_FAILED): "REC WRITE",
+    }
+    return labels.get(status_code, f"REC {status_code}")

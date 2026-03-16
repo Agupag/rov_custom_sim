@@ -208,7 +208,7 @@ class AdvancedPhysicsAnalyzer:
                     f"increase drag by {change*100:.0f}%"
                 ),
                 priority="HIGH",
-                code_location="Line ~101: LIN_DRAG_BODY = (...)"
+                code_location="Near top of rov_sim.py: LIN_DRAG_BODY = (...)"
             ))
         elif max_speed < self.TARGET_SURGE_SPEED_MIN:
             ratio = max(0.5, max_speed / self.TARGET_SURGE_SPEED_MIN)
@@ -226,7 +226,7 @@ class AdvancedPhysicsAnalyzer:
                     f"decrease drag by {change*100:.0f}%"
                 ),
                 priority="HIGH",
-                code_location="Line ~101: LIN_DRAG_BODY = (...)"
+                code_location="Near top of rov_sim.py: LIN_DRAG_BODY = (...)"
             ))
         else:
             print(f"\n✅ Speed is in good range ({max_speed:.2f} m/s)")

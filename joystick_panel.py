@@ -6,22 +6,42 @@ the main thread.  So this module launches a separate Python process that hosts
 the Tkinter window, communicating joystick axes back via shared memory
 (multiprocessing.Array).
 
-Minimal UI — camera feed, two draggable joystick knobs, two red
-heave buttons (▲ UP / ▼ DOWN) for vertical thruster control, and a
-⏺ REC / ⏹ STOP button for screen recording.
-No text overlays, no status updates, no timers except the camera poll.
+UI includes camera feed, two draggable joystick knobs, two red
+heave buttons (▲ UP / ▼ DOWN), a ⏺ REC / ⏹ STOP button,
+and a SETTINGS dialog that controls simulator runtime options
+(assist modes, camera behavior, debug toggles, thrust level, reset).
 
-Shared memory layout (10 doubles):
-  [0] surge    (-1..1)  — left stick Y
-  [1] sway     (unused, always 0)
-  [2] heave    (-1/0/+1) — red buttons: ▲ UP = +1, ▼ DN = -1
-  [3] yaw      (-1..1)  — left stick X  (positive = drag right = yaw right)
-  [4] active   (1.0 = panel open, 0.0 = closed)
-  [5] cam_tilt (-1..1)  — right stick Y  (camera servo pitch)
-  [6] roll_rad           — sim writes ROV roll (radians) for attitude indicator
-  [7] pitch_rad          — sim writes ROV pitch (radians) for attitude indicator
-  [8] rec_flag           — 1.0 = recording requested, 0.0 = stop/idle
-  [9] (reserved)
+Shared memory layout (32 doubles):
+  [0]  surge    (-1..1)  — left stick Y
+  [1]  sway     (unused, always 0)
+  [2]  heave    (-1/0/+1) — red buttons: ▲ UP = +1, ▼ DN = -1
+  [3]  yaw      (-1..1)  — left stick X
+  [4]  active   (1.0 = panel open, 0.0 = closed)
+  [5]  cam_tilt (-1..1)  — right stick Y
+  [6]  roll_rad
+  [7]  pitch_rad
+  [8]  rec_flag
+  [9]  depth_m
+  [10] heading_deg
+  [11] speed_mps
+  [12] thrust_level
+  [13] depth_hold_active
+  [14] heading_hold_active
+  [15] rec_status         — simulator writes recording error code (0 = OK)
+  [16] control_mode       — simulator writes 0 = binary, 1 = proportional
+    [17] set_thrust_level      — desired global thrust scale (0.1..1.0)
+    [18] set_proportional_mode — 0/1
+    [19] set_depth_hold        — 0/1
+    [20] set_heading_hold      — 0/1
+    [21] set_cam_follow        — 0/1
+    [22] set_cam_chase         — 0/1
+    [23] set_topdown           — 0/1
+    [24] set_show_force_viz    — 0/1
+    [25] set_thruster_failure  — 0/1
+    [26] set_emergency_surface — 0/1
+    [27] cmd_reset_rov         — pulse counter
+    [28] set_trail_enabled     — 0/1
+    [29-31] reserved
 
 Frame buffer (shared between sim and panel process):
   _frame_buf : RawArray of bytes (CAM_W * CAM_H * 3) — RGB pixels
@@ -35,18 +55,59 @@ import time
 import sys
 import os
 
+from sim_shared import (
+    ACTIVE,
+    CAM_TILT,
+    CMD_RESET_ROV,
+    CONTROL_MODE,
+    CONTROL_MODE_BINARY,
+    CTRL_H,
+    CTRL_W,
+    DEPTH_HOLD_ACTIVE,
+    DEPTH_M,
+    SET_CAM_CHASE,
+    SET_CAM_FOLLOW,
+    SET_DEPTH_HOLD,
+    SET_EMERGENCY_SURFACE,
+    SET_HEADING_HOLD,
+    SET_PROPORTIONAL_MODE,
+    SET_SHOW_FORCE_VECTORS,
+    SET_THRUST_LEVEL,
+    SET_THRUSTER_FAILURE,
+    SET_TOPDOWN,
+    SET_TRAIL_ENABLED,
+    HEADING_DEG,
+    HEADING_HOLD_ACTIVE,
+    HEAVE,
+    PITCH_RAD,
+    REC_FLAG,
+    REC_STATUS,
+    REC_STATUS_OK,
+    REC_STATUS_MISSING_DEPS,
+    REC_STATUS_WRITER_OPEN_FAILED,
+    REC_STATUS_PANEL_CAPTURE_UNAVAILABLE,
+    REC_STATUS_FRAME_WRITE_FAILED,
+    ROLL_RAD,
+    SHARED_SLOT_COUNT,
+    SPEED_MPS,
+    SURGE,
+    SWAY,
+    THRUST_LEVEL,
+    YAW,
+    control_mode_label,
+    recording_status_label,
+)
+
 # ── Constants ────────────────────────────────────────────────────────
 CAM_W = 320
 CAM_H = 240
 _FRAME_NBYTES = CAM_W * CAM_H * 3   # RGB
 
-# Controller panel dimensions (must match _panel_main)
-CTRL_W = 720
-CTRL_H = 480
+# Controller panel dimensions shared with rov_sim recording output.
 _PANEL_NBYTES = CTRL_W * CTRL_H * 3  # RGB screenshot of entire controller
 
 # ── Shared memory ────────────────────────────────────────────────────
-_shared = None      # multiprocessing.Array('d', 10)
+_shared = None      # multiprocessing.Array('d', SHARED_SLOT_COUNT)
 _frame_buf = None   # multiprocessing.RawArray('B', _FRAME_NBYTES)  — onboard camera
 _frame_seq = None   # multiprocessing.Value('i')
 _panel_buf = None   # multiprocessing.RawArray('B', _PANEL_NBYTES) — full controller screenshot
@@ -57,9 +118,14 @@ _process = None
 def _ensure_shared():
     global _shared, _frame_buf, _frame_seq, _panel_buf, _panel_seq
     if _shared is None:
-        _shared = multiprocessing.Array(ctypes.c_double, 10, lock=True)
-        for i in range(10):
+        _shared = multiprocessing.Array(ctypes.c_double, SHARED_SLOT_COUNT, lock=True)
+        for i in range(SHARED_SLOT_COUNT):
             _shared[i] = 0.0
+        _shared[REC_STATUS] = REC_STATUS_OK
+        _shared[CONTROL_MODE] = CONTROL_MODE_BINARY
+        _shared[SET_THRUST_LEVEL] = 1.0
+        _shared[SET_CAM_FOLLOW] = 1.0
+        _shared[SET_TRAIL_ENABLED] = 0.0
     if _frame_buf is None:
         _frame_buf = multiprocessing.RawArray(ctypes.c_uint8, _FRAME_NBYTES)
     if _frame_seq is None:
@@ -78,12 +144,12 @@ def get_joystick_state():
     try:
         with _shared.get_lock():
             return {
-                "surge":    _shared[0],
-                "sway":     _shared[1],
-                "heave":    _shared[2],
-                "yaw":      _shared[3],
-                "active":   _shared[4] > 0.5,
-                "cam_tilt": _shared[5],
+                "surge":    _shared[SURGE],
+                "sway":     _shared[SWAY],
+                "heave":    _shared[HEAVE],
+                "yaw":      _shared[YAW],
+                "active":   _shared[ACTIVE] > 0.5,
+                "cam_tilt": _shared[CAM_TILT],
             }
     except Exception:
         return {"surge": 0.0, "sway": 0.0, "heave": 0.0, "yaw": 0.0,
@@ -106,7 +172,7 @@ def is_recording():
         return False
     try:
         with _shared.get_lock():
-            return _shared[8] > 0.5
+            return _shared[REC_FLAG] > 0.5
     except Exception:
         return False
 
@@ -130,10 +196,22 @@ def get_panel_frame():
         return 0, None
 
 
+def get_recording_status():
+    """Return the simulator-published recording status code."""
+    if _shared is None:
+        return REC_STATUS_OK
+    try:
+        with _shared.get_lock():
+            return _shared[REC_STATUS]
+    except Exception:
+        return REC_STATUS_OK
+
+
 # ── Tkinter GUI (runs inside child process) ──────────────────────────
 def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
     """Entry point for the child process — minimal controller panel."""
     import tkinter as tk
+    from tkinter import ttk
 
     def _set(idx, val):
         try:
@@ -156,10 +234,9 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
     COL_JOY_RING = "#555560"
     COL_JOY_KNOB = "#3a3b44"
     COL_JOY_DOT  = "#22aacc"
-
-    # ── Dimensions ────────────────────────────────────────────────
-    CTRL_W = 720
-    CTRL_H = 480
+    COL_OK       = "#44cc88"
+    COL_WARN     = "#ffcc66"
+    COL_BAD      = "#ff8866"
 
     VID_W, VID_H = CAM_W, CAM_H       # 320×240
     VID_X = (CTRL_W - VID_W) // 2
@@ -281,6 +358,27 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
         canvas.create_oval(bx - 6, by - 6, bx + 6, by + 6,
                            fill="#333340", outline="#444450", width=1)
 
+    # ── Operator legend ─────────────────────────────────────────────
+    canvas.create_text(56, 56,
+                       text="L: SURGE/YAW", fill="#90c8ff",
+                       font=("Courier", 8, "bold"), anchor="w")
+    canvas.create_text(56, 72,
+                       text="R: CAM/YAW", fill="#90c8ff",
+                       font=("Courier", 8, "bold"), anchor="w")
+    canvas.create_text(56, 88,
+                       text="W/S or UP/DN: HEAVE", fill="#ffb3b3",
+                       font=("Courier", 8, "bold"), anchor="w")
+    canvas.create_text(56, 104,
+                       text="SPACE: REC   ESC: CLOSE", fill="#ffe6a3",
+                       font=("Courier", 8, "bold"), anchor="w")
+
+    _left_axes_txt = canvas.create_text(JOY_L_CX, JOY_L_CY + JOY_R + 18,
+                                        text="S:+0.00 Y:+0.00", fill="#88aacc",
+                                        font=("Courier", 8, "bold"), anchor="center")
+    _right_axes_txt = canvas.create_text(JOY_R_CX, JOY_R_CY + JOY_R + 18,
+                                         text="YT:+0.00", fill="#88aacc",
+                                         font=("Courier", 8, "bold"), anchor="center")
+
     # ── ATTITUDE INDICATOR (artificial horizon) ───────────────────
     # Small circular widget between screen and left stick area.
     # Reads roll/pitch from shared memory [6],[7] (written by sim).
@@ -321,8 +419,8 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
         """Update attitude indicator from shared memory roll/pitch."""
         try:
             with shared_arr.get_lock():
-                roll_r  = shared_arr[6]
-                pitch_r = shared_arr[7]
+                roll_r  = shared_arr[ROLL_RAD]
+                pitch_r = shared_arr[PITCH_RAD]
         except Exception:
             return
         # Roll rotates the horizon line; pitch shifts it vertically
@@ -338,6 +436,150 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
         x2 = _ATT_CX + hl * math.cos(r_rad)
         y2 = _ATT_CY - hl * math.sin(r_rad) + pitch_px
         canvas.coords(_att_horizon, x1, y1, x2, y2)
+
+    # ── TELEMETRY BAR (bottom centre of controller) ─────────────
+    # Shows depth, heading, speed, power level, and assist mode status.
+    # Updated periodically alongside camera/attitude.
+    _TELEM_Y = CTRL_H - 48
+    _TELEM_CX = CTRL_W // 2
+
+    # Background bar
+    _rrect(canvas, 140, _TELEM_Y - 14, CTRL_W - 140, _TELEM_Y + 14, 6,
+           fill="#1a1a22", outline="#2a2a35", width=1)
+
+    # Telemetry text items (updated in _update_telemetry)
+    _telem_depth = canvas.create_text(_TELEM_CX - 160, _TELEM_Y,
+        text="D: --", fill="#44cc88", font=("Courier", 9, "bold"), anchor="w")
+    _telem_heading = canvas.create_text(_TELEM_CX - 70, _TELEM_Y,
+        text="H: ---°", fill="#44aacc", font=("Courier", 9, "bold"), anchor="w")
+    _telem_speed = canvas.create_text(_TELEM_CX + 20, _TELEM_Y,
+        text="S: ----", fill="#ccaa44", font=("Courier", 9, "bold"), anchor="w")
+    _telem_power = canvas.create_text(_TELEM_CX + 110, _TELEM_Y,
+        text="P: ---%", fill="#cc6644", font=("Courier", 9, "bold"), anchor="w")
+    # Assist mode indicator (right of power)
+    _telem_assist = canvas.create_text(_TELEM_CX + 190, _TELEM_Y,
+        text="", fill="#88cc44", font=("Courier", 8, "bold"), anchor="w")
+    _telem_mode = canvas.create_text(_TELEM_CX + 245, _TELEM_Y,
+        text="BIN", fill="#dddd88", font=("Courier", 8, "bold"), anchor="w")
+    _telem_rec = canvas.create_text(_TELEM_CX + 290, _TELEM_Y,
+        text="", fill="#ff8866", font=("Courier", 8, "bold"), anchor="w")
+
+    _mode_chip = _rrect(canvas, CTRL_W - 146, 42, CTRL_W - 72, 64, 6,
+                        fill="#2d2d35", outline="#555560", width=1)
+    _mode_chip_txt = canvas.create_text(CTRL_W - 109, 53,
+                                        text="MODE BIN", fill="#dddd88",
+                                        font=("Courier", 8, "bold"), anchor="center")
+    _assist_chip = _rrect(canvas, CTRL_W - 146, 68, CTRL_W - 72, 90, 6,
+                          fill="#2d2d35", outline="#555560", width=1)
+    _assist_chip_txt = canvas.create_text(CTRL_W - 109, 79,
+                                          text="ASSIST --", fill="#aacc88",
+                                          font=("Courier", 8, "bold"), anchor="center")
+    _rec_chip = _rrect(canvas, CTRL_W - 146, 94, CTRL_W - 72, 116, 6,
+                       fill="#2d2d35", outline="#555560", width=1)
+    _rec_chip_txt = canvas.create_text(CTRL_W - 109, 105,
+                                       text="REC OK", fill="#99dd99",
+                                       font=("Courier", 8, "bold"), anchor="center")
+
+    # ── Recording-error toast overlay ──────────────────────────────
+    # Shown for ~2.5 s whenever rec_status first transitions to an error code.
+    _toast_bg = _rrect(canvas,
+                       VID_X + 16, VID_Y + VID_H // 2 - 22,
+                       VID_X + VID_W - 16, VID_Y + VID_H // 2 + 22,
+                       8, fill="#3a0e0e", outline="#cc3333", width=2, state="hidden")
+    _toast_txt = canvas.create_text(VID_X + VID_W // 2, VID_Y + VID_H // 2,
+                                    text="", fill="#ffbbaa",
+                                    font=("Helvetica", 9, "bold"), anchor="center",
+                                    state="hidden")
+    _toast_state = {"prev": REC_STATUS_OK, "cancel_id": None}
+
+    _REC_ERROR_DETAILS = {
+        int(REC_STATUS_MISSING_DEPS):              "Recording unavailable\n(cv2 / numpy not installed)",
+        int(REC_STATUS_WRITER_OPEN_FAILED):        "Recording failed to open output file",
+        int(REC_STATUS_PANEL_CAPTURE_UNAVAILABLE): "Panel capture unavailable\n(Pillow not installed)",
+        int(REC_STATUS_FRAME_WRITE_FAILED):        "Recording: frame write error",
+    }
+
+    def _show_toast(msg):
+        canvas.itemconfig(_toast_txt, text=msg, state="normal")
+        canvas.itemconfig(_toast_bg, state="normal")
+        canvas.tag_raise(_toast_bg)
+        canvas.tag_raise(_toast_txt)
+        if _toast_state["cancel_id"] is not None:
+            root.after_cancel(_toast_state["cancel_id"])
+        _toast_state["cancel_id"] = root.after(2500, _hide_toast)
+
+    def _hide_toast():
+        canvas.itemconfig(_toast_bg, state="hidden")
+        canvas.itemconfig(_toast_txt, state="hidden")
+        _toast_state["cancel_id"] = None
+
+    def _update_telemetry():
+        """Read telemetry from shared memory and update display."""
+        try:
+            with shared_arr.get_lock():
+                depth_m = shared_arr[DEPTH_M]
+                heading_deg = shared_arr[HEADING_DEG]
+                speed_mps = shared_arr[SPEED_MPS]
+                thrust_pct = shared_arr[THRUST_LEVEL]
+                dh_active = shared_arr[DEPTH_HOLD_ACTIVE] > 0.5
+                hh_active = shared_arr[HEADING_HOLD_ACTIVE] > 0.5
+                rec_status = shared_arr[REC_STATUS]
+                control_mode = shared_arr[CONTROL_MODE]
+                surge = shared_arr[SURGE]
+                yaw = shared_arr[YAW]
+                cam_tilt = shared_arr[CAM_TILT]
+        except Exception:
+            return
+        heading_wrap = heading_deg % 360.0
+        canvas.itemconfig(_telem_depth, text=f"D:{depth_m:4.1f}m")
+        canvas.itemconfig(_telem_heading, text=f"H:{heading_wrap:5.1f}\u00b0")
+        canvas.itemconfig(_telem_speed, text=f"S:{speed_mps:4.2f}")
+        canvas.itemconfig(_telem_power, text=f"P:{thrust_pct * 100:3.0f}%")
+        assists = []
+        if dh_active:
+            assists.append("DH")
+        if hh_active:
+            assists.append("HH")
+        assist_text = " ".join(assists) if assists else "--"
+        mode_text = control_mode_label(control_mode)
+        rec_text = recording_status_label(rec_status)
+
+        canvas.itemconfig(_telem_assist, text=assist_text)
+        canvas.itemconfig(_telem_mode, text=mode_text)
+        canvas.itemconfig(_telem_rec, text=rec_text)
+
+        canvas.itemconfig(_left_axes_txt, text=f"S:{surge:+.2f} Y:{yaw:+.2f}")
+        canvas.itemconfig(_right_axes_txt, text=f"YT:{cam_tilt:+.2f}")
+
+        if mode_text == "PROP":
+            canvas.itemconfig(_mode_chip, fill="#304850", outline="#44aacc")
+            canvas.itemconfig(_mode_chip_txt, text="MODE PROP", fill="#88ddff")
+        else:
+            canvas.itemconfig(_mode_chip, fill="#3c3a24", outline="#bbaa55")
+            canvas.itemconfig(_mode_chip_txt, text="MODE BIN", fill="#ffdd88")
+
+        if assists:
+            canvas.itemconfig(_assist_chip, fill="#2f452f", outline="#66aa66")
+            canvas.itemconfig(_assist_chip_txt, text=f"ASSIST {assist_text}", fill="#aaffaa")
+        else:
+            canvas.itemconfig(_assist_chip, fill="#2d2d35", outline="#555560")
+            canvas.itemconfig(_assist_chip_txt, text="ASSIST --", fill="#a0a0aa")
+
+        if rec_status == REC_STATUS_OK:
+            canvas.itemconfig(_rec_chip, fill="#2f452f", outline="#66aa66")
+            canvas.itemconfig(_rec_chip_txt, text="REC OK", fill="#99dd99")
+        else:
+            canvas.itemconfig(_rec_chip, fill="#4a2f2f", outline="#cc6666")
+            canvas.itemconfig(_rec_chip_txt, text=f"REC {rec_text}", fill="#ffaaaa")
+
+        # Show toast when recording status first transitions to a new error code.
+        if rec_status != _toast_state["prev"]:
+            _toast_state["prev"] = rec_status
+            if rec_status != REC_STATUS_OK:
+                msg = _REC_ERROR_DETAILS.get(
+                    int(round(rec_status)),
+                    f"Recording error ({int(round(rec_status))})")
+                _show_toast(msg)
 
     # ── HEAVE BUTTONS (red, right side) ───────────────────────────
     # Two large red buttons for vertical thruster: ▲ UP and ▼ DOWN.
@@ -382,14 +624,24 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
     # Heave button state
     _heave_state = {"up": False, "dn": False}
 
+    def _set_heave_up(active):
+        _heave_state["up"] = bool(active)
+        canvas.itemconfig(_hbtn_up, fill=COL_BTN_RED_PRESS if active else COL_BTN_RED)
+        _heave_update()
+
+    def _set_heave_dn(active):
+        _heave_state["dn"] = bool(active)
+        canvas.itemconfig(_hbtn_dn, fill=COL_BTN_RED_PRESS if active else COL_BTN_RED)
+        _heave_update()
+
     def _heave_update():
         """Write combined heave to shared memory: +1 up, -1 down, 0 off."""
         if _heave_state["up"] and not _heave_state["dn"]:
-            _set(2, 1.0)
+            _set(HEAVE, 1.0)
         elif _heave_state["dn"] and not _heave_state["up"]:
-            _set(2, -1.0)
+            _set(HEAVE, -1.0)
         else:
-            _set(2, 0.0)
+            _set(HEAVE, 0.0)
 
     def _in_rect(mx, my, x1, y1, x2, y2):
         return x1 <= mx <= x2 and y1 <= my <= y2
@@ -399,26 +651,20 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
         ux1 = _HEAVE_CX - _HEAVE_BTN_W // 2
         ux2 = _HEAVE_CX + _HEAVE_BTN_W // 2
         if _in_rect(mx, my, ux1, _hbtn_up_y1, ux2, _hbtn_up_y2):
-            _heave_state["up"] = True
-            canvas.itemconfig(_hbtn_up, fill=COL_BTN_RED_PRESS)
-            _heave_update()
+            _set_heave_up(True)
             return True
         if _in_rect(mx, my, ux1, _hbtn_dn_y1, ux2, _hbtn_dn_y2):
-            _heave_state["dn"] = True
-            canvas.itemconfig(_hbtn_dn, fill=COL_BTN_RED_PRESS)
-            _heave_update()
+            _set_heave_dn(True)
             return True
         return False
 
     def _heave_release(event):
         changed = False
         if _heave_state["up"]:
-            _heave_state["up"] = False
-            canvas.itemconfig(_hbtn_up, fill=COL_BTN_RED)
+            _set_heave_up(False)
             changed = True
         if _heave_state["dn"]:
-            _heave_state["dn"] = False
-            canvas.itemconfig(_hbtn_dn, fill=COL_BTN_RED)
+            _set_heave_dn(False)
             changed = True
         if changed:
             _heave_update()
@@ -453,12 +699,12 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
     def _rec_toggle():
         _rec_state["on"] = not _rec_state["on"]
         if _rec_state["on"]:
-            _set(8, 1.0)
+            _set(REC_FLAG, 1.0)
             canvas.itemconfig(_rec_btn, fill=COL_REC_ACTIVE, outline=COL_REC_ACT_OUT)
             canvas.itemconfig(_rec_btn_txt, text="⏹ STOP", fill=COL_REC_ACT_LBL)
             _rec_flash()
         else:
-            _set(8, 0.0)
+            _set(REC_FLAG, 0.0)
             canvas.itemconfig(_rec_btn, fill=COL_REC_IDLE, outline=COL_REC_IDLE_OUT)
             canvas.itemconfig(_rec_btn_txt, text="⏺ REC", fill=COL_REC_LABEL)
 
@@ -480,6 +726,149 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
         ry2 = _REC_CY + _REC_BTN_H // 2
         if _in_rect(mx, my, rx1, ry1, rx2, ry2):
             _rec_toggle()
+            return True
+        return False
+
+    # ── Settings dialog (single source of runtime settings) ───────
+    _settings_state = {
+        "win": None,
+        "reset_seq": 0,
+    }
+
+    _set_thrust_var = tk.DoubleVar(value=1.0)
+    _set_prop_var = tk.BooleanVar(value=False)
+    _set_depth_hold_var = tk.BooleanVar(value=False)
+    _set_heading_hold_var = tk.BooleanVar(value=False)
+    _set_cam_follow_var = tk.BooleanVar(value=True)
+    _set_cam_chase_var = tk.BooleanVar(value=False)
+    _set_topdown_var = tk.BooleanVar(value=False)
+    _set_force_viz_var = tk.BooleanVar(value=False)
+    _set_thr_fail_var = tk.BooleanVar(value=False)
+    _set_emergency_var = tk.BooleanVar(value=False)
+    _set_trail_var = tk.BooleanVar(value=False)
+
+    def _publish_settings_to_shared():
+        try:
+            with shared_arr.get_lock():
+                shared_arr[SET_THRUST_LEVEL] = float(_set_thrust_var.get())
+                shared_arr[SET_PROPORTIONAL_MODE] = 1.0 if _set_prop_var.get() else 0.0
+                shared_arr[SET_DEPTH_HOLD] = 1.0 if _set_depth_hold_var.get() else 0.0
+                shared_arr[SET_HEADING_HOLD] = 1.0 if _set_heading_hold_var.get() else 0.0
+                shared_arr[SET_CAM_FOLLOW] = 1.0 if _set_cam_follow_var.get() else 0.0
+                shared_arr[SET_CAM_CHASE] = 1.0 if _set_cam_chase_var.get() else 0.0
+                shared_arr[SET_TOPDOWN] = 1.0 if _set_topdown_var.get() else 0.0
+                shared_arr[SET_SHOW_FORCE_VECTORS] = 1.0 if _set_force_viz_var.get() else 0.0
+                shared_arr[SET_THRUSTER_FAILURE] = 1.0 if _set_thr_fail_var.get() else 0.0
+                shared_arr[SET_EMERGENCY_SURFACE] = 1.0 if _set_emergency_var.get() else 0.0
+                shared_arr[SET_TRAIL_ENABLED] = 1.0 if _set_trail_var.get() else 0.0
+        except Exception:
+            pass
+
+    def _send_reset_command():
+        _settings_state["reset_seq"] += 1
+        try:
+            with shared_arr.get_lock():
+                shared_arr[CMD_RESET_ROV] = float(_settings_state["reset_seq"])
+        except Exception:
+            pass
+
+    def _new_check(parent, text, var):
+        return ttk.Checkbutton(parent, text=text, variable=var, command=_publish_settings_to_shared)
+
+    def _open_settings_window():
+        w = _settings_state["win"]
+        if w is not None and w.winfo_exists():
+            w.lift()
+            w.focus_force()
+            return
+
+        w = tk.Toplevel(root)
+        _settings_state["win"] = w
+        w.title("ROV Settings")
+        w.geometry("390x470+770+90")
+        w.resizable(False, False)
+        w.configure(bg="#171921")
+
+        style = ttk.Style(w)
+        style.configure("Panel.TFrame", background="#171921")
+        style.configure("Card.TLabelframe", background="#1f2230", foreground="#d8e0ef")
+        style.configure("Card.TLabelframe.Label", background="#1f2230", foreground="#d8e0ef")
+        style.configure("Panel.TLabel", background="#171921", foreground="#a9b6d3")
+
+        outer = ttk.Frame(w, style="Panel.TFrame", padding=12)
+        outer.pack(fill="both", expand=True)
+
+        title = tk.Label(outer, text="Runtime Controls", bg="#171921", fg="#dce6ff",
+                         font=("Helvetica", 13, "bold"))
+        title.pack(anchor="w")
+        subtitle = tk.Label(outer, text="All simulator settings are controlled from this panel.",
+                            bg="#171921", fg="#8ea0c7", font=("Helvetica", 9))
+        subtitle.pack(anchor="w", pady=(0, 8))
+
+        prop_frame = ttk.LabelFrame(outer, text="Propulsion", style="Card.TLabelframe", padding=10)
+        prop_frame.pack(fill="x", pady=(0, 8))
+        tk.Label(prop_frame, text="Thrust Level", bg="#1f2230", fg="#d7e0f2",
+                 font=("Helvetica", 10, "bold")).pack(anchor="w")
+        thrust_scale = ttk.Scale(prop_frame, from_=0.1, to=1.0, variable=_set_thrust_var,
+                                 command=lambda _v: _publish_settings_to_shared())
+        thrust_scale.pack(fill="x", pady=(6, 2))
+        _thrust_label = tk.Label(prop_frame, text="100%", bg="#1f2230", fg="#7fd5ff", font=("Courier", 9, "bold"))
+        _thrust_label.pack(anchor="e")
+        _new_check(prop_frame, "Proportional Joystick Mode", _set_prop_var).pack(anchor="w", pady=(6, 0))
+        _new_check(prop_frame, "Emergency Surface", _set_emergency_var).pack(anchor="w", pady=(4, 0))
+
+        assist_frame = ttk.LabelFrame(outer, text="Assist", style="Card.TLabelframe", padding=10)
+        assist_frame.pack(fill="x", pady=(0, 8))
+        _new_check(assist_frame, "Depth Hold", _set_depth_hold_var).pack(anchor="w")
+        _new_check(assist_frame, "Heading Hold", _set_heading_hold_var).pack(anchor="w", pady=(4, 0))
+
+        cam_frame = ttk.LabelFrame(outer, text="Camera", style="Card.TLabelframe", padding=10)
+        cam_frame.pack(fill="x", pady=(0, 8))
+        _new_check(cam_frame, "Follow ROV", _set_cam_follow_var).pack(anchor="w")
+        _new_check(cam_frame, "Chase Camera", _set_cam_chase_var).pack(anchor="w", pady=(4, 0))
+        _new_check(cam_frame, "Top-Down View", _set_topdown_var).pack(anchor="w", pady=(4, 0))
+
+        diag_frame = ttk.LabelFrame(outer, text="Diagnostics", style="Card.TLabelframe", padding=10)
+        diag_frame.pack(fill="x", pady=(0, 8))
+        _new_check(diag_frame, "Show Force Vectors", _set_force_viz_var).pack(anchor="w")
+        _new_check(diag_frame, "Thruster Failure Simulation", _set_thr_fail_var).pack(anchor="w", pady=(4, 0))
+        _new_check(diag_frame, "Trail Rendering", _set_trail_var).pack(anchor="w", pady=(4, 0))
+
+        action_row = ttk.Frame(outer, style="Panel.TFrame")
+        action_row.pack(fill="x", pady=(4, 0))
+        ttk.Button(action_row, text="Reset ROV", command=_send_reset_command).pack(side="left")
+        ttk.Button(action_row, text="Close", command=w.destroy).pack(side="right")
+
+        def _update_settings_labels():
+            _thrust_label.config(text=f"{int(round(_set_thrust_var.get() * 100.0)):d}%")
+            _publish_settings_to_shared()
+            if w.winfo_exists():
+                w.after(120, _update_settings_labels)
+
+        _update_settings_labels()
+
+    _SET_BTN_W = 76
+    _SET_BTN_H = 22
+    _SET_BTN_R = 6
+    _SET_CX = _REC_CX + 82
+    _SET_CY = _REC_CY
+    _set_btn = _rrect(canvas,
+                      _SET_CX - _SET_BTN_W // 2, _SET_CY - _SET_BTN_H // 2,
+                      _SET_CX + _SET_BTN_W // 2, _SET_CY + _SET_BTN_H // 2,
+                      _SET_BTN_R,
+                      fill="#244a66", outline="#2a7399", width=2)
+    _set_btn_txt = canvas.create_text(_SET_CX, _SET_CY,
+                                      text="SETTINGS", fill="#d3ecff",
+                                      font=("Helvetica", 8, "bold"))
+
+    def _settings_press(event):
+        mx, my = event.x, event.y
+        sx1 = _SET_CX - _SET_BTN_W // 2
+        sx2 = _SET_CX + _SET_BTN_W // 2
+        sy1 = _SET_CY - _SET_BTN_H // 2
+        sy2 = _SET_CY + _SET_BTN_H // 2
+        if _in_rect(mx, my, sx1, sy1, sx2, sy2):
+            _open_settings_window()
             return True
         return False
 
@@ -536,6 +925,9 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
         # Check record button first
         if _rec_press(event):
             return
+        # Settings button
+        if _settings_press(event):
+            return
         # Check heave buttons first (they take priority over joystick drag)
         if _heave_press(event):
             _drag["active"] = "heave"
@@ -546,46 +938,46 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
         if dl < JOY_R + 20:
             _drag["active"] = "left"
             ax, ay = _move_knob(_lknob, _lknob_dot, JOY_L_CX, JOY_L_CY, mx, my, JOY_R)
-            _set(0, ay)       # surge = up/down
-            _set(3, ax)       # yaw   = left/right (positive ax = drag right = yaw right)
+            _set(SURGE, ay)       # surge = up/down
+            _set(YAW, ax)         # yaw   = left/right (positive ax = drag right = yaw right)
         elif dr < JOY_R + 20:
             _drag["active"] = "right"
             ax, ay = _move_knob(_rknob, _rknob_dot, JOY_R_CX, JOY_R_CY, mx, my, JOY_R)
-            _set(3, _shared_yaw_from_left[0] + ax)  # right stick X adds to yaw
-            _set(5, ay)       # cam_tilt = up/down
+            _set(YAW, _shared_yaw_from_left[0] + ax)  # right stick X adds to yaw
+            _set(CAM_TILT, ay)       # cam_tilt = up/down
 
     def _on_drag(event):
         mx, my = event.x, event.y
         if _drag["active"] == "left":
             ax, ay = _move_knob(_lknob, _lknob_dot, JOY_L_CX, JOY_L_CY, mx, my, JOY_R)
-            _set(0, ay)       # surge
-            _set(3, ax)       # yaw from left stick (positive ax = drag right = yaw right)
+            _set(SURGE, ay)   # surge
+            _set(YAW, ax)     # yaw from left stick (positive ax = drag right = yaw right)
             _shared_yaw_from_left[0] = ax
         elif _drag["active"] == "right":
             ax, ay = _move_knob(_rknob, _rknob_dot, JOY_R_CX, JOY_R_CY, mx, my, JOY_R)
-            _set(3, _shared_yaw_from_left[0] + ax)  # right stick X adds to yaw
-            _set(5, ay)       # cam_tilt
+            _set(YAW, _shared_yaw_from_left[0] + ax)  # right stick X adds to yaw
+            _set(CAM_TILT, ay)       # cam_tilt
 
     def _on_release(event):
         if _drag["active"] == "heave":
             _heave_release(event)
         elif _drag["active"] == "left":
             _snap_knob(_lknob, _lknob_dot, JOY_L_CX, JOY_L_CY)
-            _set(0, 0.0)
+            _set(SURGE, 0.0)
             _shared_yaw_from_left[0] = 0.0
             # Preserve right-stick yaw contribution if right stick is also active
-            _set(3, 0.0)
+            _set(YAW, 0.0)
         elif _drag["active"] == "right":
             _snap_knob(_rknob, _rknob_dot, JOY_R_CX, JOY_R_CY)
-            _set(3, _shared_yaw_from_left[0])  # Restore to just left-stick yaw
-            _set(5, 0.0)
+            _set(YAW, _shared_yaw_from_left[0])  # Restore to just left-stick yaw
+            _set(CAM_TILT, 0.0)
         _drag["active"] = None
 
     canvas.bind("<ButtonPress-1>", _on_press)
     canvas.bind("<B1-Motion>", _on_drag)
     canvas.bind("<ButtonRelease-1>", _on_release)
 
-    _set(4, 1.0)
+    _set(ACTIVE, 1.0)
 
     # ── Camera frame update (only timer in the panel) ─────────────
     _photo_ref = [None]
@@ -603,12 +995,18 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
 
     def _capture_panel():
         """Grab a screenshot of this Tkinter window and write into panel_buf."""
+        try:
+            with shared_arr.get_lock():
+                rec_on = shared_arr[REC_FLAG] > 0.5
+        except Exception:
+            return
+        if not rec_on:
+            return
         if not _has_imagegrab:
+            _set(REC_STATUS, REC_STATUS_PANEL_CAPTURE_UNAVAILABLE)
             return
         try:
             # Check if recording is active
-            with shared_arr.get_lock():
-                rec_on = shared_arr[8] > 0.5
             if not rec_on:
                 return
             # Get window position and size on screen
@@ -631,7 +1029,7 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
             with panel_seq.get_lock():
                 panel_seq.value += 1
         except Exception:
-            pass
+            _set(REC_STATUS, REC_STATUS_PANEL_CAPTURE_UNAVAILABLE)
 
     def _update_camera():
         try:
@@ -654,6 +1052,10 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
                 pass
         # Update attitude indicator alongside camera frame
         _update_attitude()
+        # Update telemetry display
+        _update_telemetry()
+        # Publish panel settings to simulator every UI tick
+        _publish_settings_to_shared()
         # Capture panel screenshot for recording (if active)
         _capture_panel()
         root.after(_CAM_POLL_MS, _update_camera)
@@ -662,16 +1064,22 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
 
     # ── Close handler ─────────────────────────────────────────────
     def _on_close():
-        _set(4, 0.0)
-        _set(8, 0.0)   # stop recording
+        sw = _settings_state.get("win")
+        if sw is not None:
+            try:
+                sw.destroy()
+            except Exception:
+                pass
+        _set(ACTIVE, 0.0)
+        _set(REC_FLAG, 0.0)   # stop recording
         for i in range(6):
             _set(i, 0.0)
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", _on_close)
     root.mainloop()
-    _set(4, 0.0)
-    _set(8, 0.0)   # stop recording
+    _set(ACTIVE, 0.0)
+    _set(REC_FLAG, 0.0)   # stop recording
     for i in range(6):
         _set(i, 0.0)
 
@@ -697,8 +1105,9 @@ def stop_joystick_panel():
     if _shared is not None:
         try:
             with _shared.get_lock():
-                _shared[4] = 0.0
-                _shared[8] = 0.0   # stop recording
+                _shared[ACTIVE] = 0.0
+                _shared[REC_FLAG] = 0.0   # stop recording
+                _shared[REC_STATUS] = REC_STATUS_OK
                 for i in range(6):
                     _shared[i] = 0.0
         except Exception:
@@ -717,13 +1126,36 @@ def clamp_val(x, lo, hi):
     return lo if x < lo else hi if x > hi else x
 
 
-def mix_joystick_to_thruster_cmds(state, n_thrusters):
+def _apply_input_curve(val, exponent=1.5, deadzone=0.15):
     """
-    Convert joystick axes to per-thruster ON/OFF commands.
+    Apply deadzone and exponential curve to a joystick axis value.
 
-    IMPORTANT: Real thrusters are binary — they can only be ON (full power)
-    or OFF.  There is no variable-speed PWM.  The mixer therefore outputs
-    only -1, 0, or +1 for each thruster.
+    Args:
+        val: raw axis value (-1..1)
+        exponent: curve exponent (>1 = more precision near centre)
+        deadzone: fraction of travel treated as zero
+
+    Returns:
+        Shaped value (-1..1) with deadzone removed and curve applied.
+    """
+    if abs(val) < deadzone:
+        return 0.0
+    # Remove deadzone from the active range
+    sign = 1.0 if val > 0 else -1.0
+    normalized = (abs(val) - deadzone) / (1.0 - deadzone)
+    normalized = min(1.0, max(0.0, normalized))
+    # Apply power curve
+    shaped = normalized ** exponent
+    return sign * shaped
+
+
+def mix_joystick_to_thruster_cmds(state, n_thrusters, proportional=False,
+                                   input_exponent=1.5, input_deadzone=0.15):
+    """
+    Convert joystick axes to per-thruster commands.
+
+    When proportional=False (default): outputs only -1, 0, or +1 (binary mode).
+    When proportional=True: outputs continuous -1..+1 with input curve shaping.
 
     DDR thruster layout (after GLTF detection + body-frame rotation):
       T1 = rear-right — angled ~40° outboard. cmd=+1 pushes forward+left, yaw-left torque
@@ -744,10 +1176,8 @@ def mix_joystick_to_thruster_cmds(state, n_thrusters):
       raw_T2 = surge_cmd + yaw_cmd
       raw_T4 = surge_cmd
 
-    Each raw value is then snapped to -1, 0, or +1:
-      |raw| < threshold  → 0 (OFF)
-      raw > 0            → +1 (ON forward)
-      raw < 0            → -1 (ON reverse)
+    Each raw value is then snapped to -1, 0, or +1 (binary mode) or
+    clamped to -1..+1 (proportional mode).
 
     Sign convention (verified from geometry):
       T1 cmd=+1 → yaw torque +1.14 N·m (CCW = yaw LEFT)
@@ -760,36 +1190,53 @@ def mix_joystick_to_thruster_cmds(state, n_thrusters):
     surge = state.get("surge", 0.0)
     yaw   = state.get("yaw", 0.0)
 
-    DEAD = 0.15
+    DEAD = input_deadzone
     mag = math.sqrt(surge * surge + yaw * yaw)
 
     cmds = [0.0] * n_thrusters
     if mag < DEAD:
         return cmds
 
-    # Compute raw proportional values, then snap to binary.
-    # All horizontal thrusters contribute to surge,
-    # T1/T2 differential creates yaw torque.
-    raw_t1 = surge - yaw   # yaw right → less T1 (less CCW torque)
-    raw_t2 = surge + yaw   # yaw right → more T2 (more CW torque)
-    raw_t4 = surge          # pure forward/reverse
+    if proportional:
+        # Apply input curves to each axis independently
+        surge_shaped = _apply_input_curve(surge, input_exponent, DEAD)
+        yaw_shaped = _apply_input_curve(yaw, input_exponent, DEAD)
 
-    # Snap to binary: -1, 0, or +1
-    SNAP_THRESHOLD = 0.15   # below this magnitude → OFF
-    def _snap(val):
-        if abs(val) < SNAP_THRESHOLD:
-            return 0.0
-        return 1.0 if val > 0 else -1.0
+        # Compute raw proportional values
+        raw_t1 = surge_shaped - yaw_shaped
+        raw_t2 = surge_shaped + yaw_shaped
+        raw_t4 = surge_shaped
 
-    t1 = _snap(raw_t1)
-    t2 = _snap(raw_t2)
-    t4 = _snap(raw_t4)
+        # Clamp to -1..+1
+        def _clamp(v):
+            return max(-1.0, min(1.0, v))
 
-    if n_thrusters >= 1:
-        cmds[0] = t1
-    if n_thrusters >= 2:
-        cmds[1] = t2
-    # T3 (vertical) left as 0 — keyboard only
-    if n_thrusters >= 4:
-        cmds[3] = t4
+        if n_thrusters >= 1:
+            cmds[0] = _clamp(raw_t1)
+        if n_thrusters >= 2:
+            cmds[1] = _clamp(raw_t2)
+        if n_thrusters >= 4:
+            cmds[3] = _clamp(raw_t4)
+    else:
+        # Binary mode: snap to -1, 0, or +1
+        raw_t1 = surge - yaw
+        raw_t2 = surge + yaw
+        raw_t4 = surge
+
+        SNAP_THRESHOLD = 0.15
+        def _snap(val):
+            if abs(val) < SNAP_THRESHOLD:
+                return 0.0
+            return 1.0 if val > 0 else -1.0
+
+        t1 = _snap(raw_t1)
+        t2 = _snap(raw_t2)
+        t4 = _snap(raw_t4)
+
+        if n_thrusters >= 1:
+            cmds[0] = t1
+        if n_thrusters >= 2:
+            cmds[1] = t2
+        if n_thrusters >= 4:
+            cmds[3] = t4
     return cmds

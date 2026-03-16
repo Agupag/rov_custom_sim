@@ -28,8 +28,13 @@ datas = [
     # ROV mesh assets (must be next to the exe)
     ('Assembly 1.obj', '.'),
     ('Assembly 1.gltf', '.'),
-    # joystick panel module
+    # versioned CAD configs (v1/v2/v3 used by THRUSTER_CONFIGS auto-discovery)
+    ('v1.obj', '.'), ('v1.gltf', '.'), ('v1.mtl', '.'),
+    ('v2.obj', '.'), ('v2.gltf', '.'), ('v2.mtl', '.'),
+    ('v3.obj', '.'), ('v3.gltf', '.'), ('v3.mtl', '.'),
+    # joystick panel and shared-memory contract modules
     ('joystick_panel.py', '.'),
+    ('sim_shared.py', '.'),
     # pybullet_data (plane.urdf, textures, etc.)
     (pybullet_data_dir, 'pybullet_data'),
 ]
@@ -40,6 +45,7 @@ hiddenimports = [
     'pybullet_data',
     'numpy',
     'joystick_panel',
+    'sim_shared',
     'tkinter',
     'ctypes',
     'multiprocessing',

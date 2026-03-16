@@ -189,18 +189,16 @@ print("  YAW SIGN CHAIN TRACE")
 print(f"{'─'*72}")
 print("  User drags joystick LEFT on screen:")
 print("    → knob moves left → dx < 0 → ax = dx/radius < 0")
-print("    → _set(3, -ax) → _shared[3] > 0 → yaw > 0 (POSITIVE)")
-print("    → mixer sees yaw=+1.0 → what zone?")
-cmds_yaw_pos = mix_joystick_to_thruster_cmds({"surge": 0.0, "sway": 0.0, "heave": 0.0, "yaw": 1.0}, 4)
-print(f"    → T1={cmds_yaw_pos[0]:+.1f} T2={cmds_yaw_pos[1]:+.1f} T4={cmds_yaw_pos[3]:+.1f}")
+print("    → _set(YAW, ax) → yaw < 0 (NEGATIVE)")
+cmds_yaw_neg = mix_joystick_to_thruster_cmds({"surge": 0.0, "sway": 0.0, "heave": 0.0, "yaw": -1.0}, 4)
+print(f"    → T1={cmds_yaw_neg[0]:+.1f} T2={cmds_yaw_neg[1]:+.1f} T4={cmds_yaw_neg[3]:+.1f}")
 
-# Check which way this actually yaws
 net_tz = 0
 for i, t in enumerate(THRUSTERS):
-    if t["kind"] == "V" or cmds_yaw_pos[i] == 0:
+    if t["kind"] == "V" or cmds_yaw_neg[i] == 0:
         continue
     dw = p.rotateVector(base_quat, t["dir"])
-    force = (dw[0]*rov_sim.MAX_THRUST_H*cmds_yaw_pos[i], dw[1]*rov_sim.MAX_THRUST_H*cmds_yaw_pos[i], dw[2]*rov_sim.MAX_THRUST_H*cmds_yaw_pos[i])
+    force = (dw[0]*rov_sim.MAX_THRUST_H*cmds_yaw_neg[i], dw[1]*rov_sim.MAX_THRUST_H*cmds_yaw_neg[i], dw[2]*rov_sim.MAX_THRUST_H*cmds_yaw_neg[i])
     rel_world = p.rotateVector(base_quat, t["pos"])
     torque = vcross(rel_world, force)
     net_tz += torque[2]
@@ -211,16 +209,16 @@ print(f"    → {'✅ CORRECT' if net_tz > 0 else '❌ BACKWARDS — need to fix
 print()
 print("  User drags joystick RIGHT on screen:")
 print("    → knob moves right → dx > 0 → ax = dx/radius > 0")
-print("    → _set(3, -ax) → _shared[3] < 0 → yaw < 0 (NEGATIVE)")
-cmds_yaw_neg = mix_joystick_to_thruster_cmds({"surge": 0.0, "sway": 0.0, "heave": 0.0, "yaw": -1.0}, 4)
-print(f"    → T1={cmds_yaw_neg[0]:+.1f} T2={cmds_yaw_neg[1]:+.1f} T4={cmds_yaw_neg[3]:+.1f}")
+print("    → _set(YAW, ax) → yaw > 0 (POSITIVE)")
+cmds_yaw_pos = mix_joystick_to_thruster_cmds({"surge": 0.0, "sway": 0.0, "heave": 0.0, "yaw": 1.0}, 4)
+print(f"    → T1={cmds_yaw_pos[0]:+.1f} T2={cmds_yaw_pos[1]:+.1f} T4={cmds_yaw_pos[3]:+.1f}")
 
 net_tz2 = 0
 for i, t in enumerate(THRUSTERS):
-    if t["kind"] == "V" or cmds_yaw_neg[i] == 0:
+    if t["kind"] == "V" or cmds_yaw_pos[i] == 0:
         continue
     dw = p.rotateVector(base_quat, t["dir"])
-    force = (dw[0]*rov_sim.MAX_THRUST_H*cmds_yaw_neg[i], dw[1]*rov_sim.MAX_THRUST_H*cmds_yaw_neg[i], dw[2]*rov_sim.MAX_THRUST_H*cmds_yaw_neg[i])
+    force = (dw[0]*rov_sim.MAX_THRUST_H*cmds_yaw_pos[i], dw[1]*rov_sim.MAX_THRUST_H*cmds_yaw_pos[i], dw[2]*rov_sim.MAX_THRUST_H*cmds_yaw_pos[i])
     rel_world = p.rotateVector(base_quat, t["pos"])
     torque = vcross(rel_world, force)
     net_tz2 += torque[2]

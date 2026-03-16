@@ -44,22 +44,42 @@ Shared memory layout in `joystick_panel.py`:
 - `[6] roll_rad`
 - `[7] pitch_rad`
 - `[8] rec_flag`
-- `[9] reserved`
+- `[9] depth_m`
+- `[10] heading_deg`
+- `[11] speed_mps`
+- `[12] thrust_level`
+- `[13] depth_hold_active`
+- `[14] heading_hold_active`
+- `[15] rec_status`
+- `[16] control_mode`
+- `[17] set_thrust_level`
+- `[18] set_proportional_mode`
+- `[19] set_depth_hold`
+- `[20] set_heading_hold`
+- `[21] set_cam_follow`
+- `[22] set_cam_chase`
+- `[23] set_topdown`
+- `[24] set_show_force_vectors`
+- `[25] set_thruster_failure`
+- `[26] set_emergency_surface`
+- `[27] cmd_reset_rov`
+- `[28] set_trail_enabled`
+- `[29-31] reserved`
 
 There are also raw RGB buffers for the onboard camera frame and full panel screenshot.
 
 ## Control Semantics
 
-The current joystick mixer is binary.
+The current joystick mixer defaults to binary output and also supports an optional proportional mode.
 
-- It does not output proportional thrust.
-- It returns `-1`, `0`, or `+1` for each thruster.
+- Default mode returns `-1`, `0`, or `+1` per thruster.
+- Optional proportional mode outputs continuous values in `[-1, +1]` and is used for diagnostics and tuning workflows.
 - `T1 = surge - yaw`
 - `T2 = surge + yaw`
 - `T4 = surge`
 - `T3` is controlled separately through the heave path rather than the joystick mixer output.
 
-Smooth behavior comes from spool dynamics in `rov_sim.py`, not from analog PWM commands.
+Smooth behavior comes from spool dynamics in `rov_sim.py`, not from analog PWM commands alone.
 
 The reverse sign-change cooldown is enforced in the simulator loop, not inside the mixer.
 
@@ -89,11 +109,13 @@ The simulator also uses the GLTF when possible to locate the onboard camera pose
 
 The diagnostics are the intended validation layer.
 
+- `test_extended_diagnostics.py` is the assist-mode and GLTF frame validation suite and writes a baseline JSON report.
 - `test_sim_diagnostic.py` is useful when changing signs, axes, or thruster behavior.
 - `test_physics_realistic.py` is useful when tuning drag, added mass, buoyancy, or spool constants.
 - `test_mixer_analysis.py` is useful when reasoning about the geometry and force decomposition.
 - `test_joystick.py` and `test_joystick_full.py` are useful when touching shared memory or cooldown logic.
 - `test_thruster_logic.py` is the fast check for persistent reverse behavior.
+- `tools/run_validation_and_calibration.py` runs the full diagnostics plus calibration artifact regeneration pipeline in one command.
 
 These scripts are behavior-oriented. They are not all meant to be run under pytest as strict automated unit tests.
 

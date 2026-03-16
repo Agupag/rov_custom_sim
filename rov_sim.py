@@ -10,23 +10,57 @@ from datetime import datetime
 
 try:
     import cv2  # optional (used for camera preview window)
-except Exception:
+except ImportError:
     cv2 = None
 
 try:
     import numpy as np
     HAS_NUMPY = True
-except Exception:
+except ImportError:
     HAS_NUMPY = False
 
 import pybullet as p
 import pybullet_data
 
+from sim_shared import (
+    CMD_RESET_ROV,
+    CONTROL_MODE,
+    CONTROL_MODE_BINARY,
+    CONTROL_MODE_PROPORTIONAL,
+    CTRL_H,
+    CTRL_W,
+    DEPTH_HOLD_ACTIVE,
+    DEPTH_M,
+    HEADING_DEG,
+    HEADING_HOLD_ACTIVE,
+    PITCH_RAD,
+    REC_FLAG,
+    REC_STATUS,
+    REC_STATUS_FRAME_WRITE_FAILED,
+    REC_STATUS_MISSING_DEPS,
+    REC_STATUS_OK,
+    REC_STATUS_WRITER_OPEN_FAILED,
+    ROLL_RAD,
+    SET_CAM_CHASE,
+    SET_CAM_FOLLOW,
+    SET_DEPTH_HOLD,
+    SET_EMERGENCY_SURFACE,
+    SET_HEADING_HOLD,
+    SET_PROPORTIONAL_MODE,
+    SET_SHOW_FORCE_VECTORS,
+    SET_THRUST_LEVEL,
+    SET_THRUSTER_FAILURE,
+    SET_TOPDOWN,
+    SET_TRAIL_ENABLED,
+    SPEED_MPS,
+    THRUST_LEVEL as SHM_THRUST_LEVEL,
+)
+
 # Joystick control panel (separate Tkinter window)
 try:
     import joystick_panel
     HAS_JOYSTICK = True
-except Exception:
+except ImportError:
     HAS_JOYSTICK = False
 
 # If the simulator is asked to quit via ESC, set this flag so an external
@@ -59,7 +93,8 @@ def print(*args, **kwargs):
         if _log_file_handle is not None:
             _log_file_handle.write(msg + "\n")
             # Don't flush every line — let the OS buffer handle it
-    except Exception:
+    except (OSError, ValueError):
+        # ValueError: I/O operation on closed file
         pass
 
 """
@@ -164,7 +199,7 @@ AREA = [0.0929, 0.0929, 0.1238]       # m² — measured from CAD per DDR
 # from frame struts, housings, etc. Ensures the ROV stops at low speeds
 # where quadratic drag alone is negligible.
 # Fossen (Sec 8.4.2): D_linear = diag(X_u, Y_v, Z_w, K_p, M_q, N_r)
-LIN_DRAG_BODY = (4.0, 5.0, 6.0)       # translational (N per m/s)
+LIN_DRAG_BODY = (4.8, 5.0, 6.0)       # translational (N per m/s)
 LIN_DRAG_ANG  = (2.5, 2.5, 2.0)       # rotational   (N·m per rad/s)
 
 # Quadratic (nonlinear) damping: D_nonlin · |ν| · ν
@@ -310,17 +345,21 @@ MAX_DRAG_TORQUE = 50.0   # Clamp on damping torques (N*m)
 THRUSTER_CONFIGS = {}
 
 # Discover available configurations from CAD files present on disk.
-# v1/v2 naming convention: v<N>.obj + v<N>.gltf
-for _vn in sorted(os.listdir(DATA_DIR)):
+# Versioned naming convention: v<N>.obj + v<N>.gltf (e.g., v1, v2, v3).
+_versioned_cfgs = []
+for _vn in os.listdir(DATA_DIR):
     _base, _ext = os.path.splitext(_vn)
     if _ext.lower() == ".obj" and os.path.exists(os.path.join(DATA_DIR, _base + ".gltf")):
         # Skip legacy "Assembly 1" if v-configs exist (will be added as fallback below)
         if _base.lower().startswith("v") and _base[1:].isdigit():
-            _label = f"Configuration {_base.upper()}"
-            THRUSTER_CONFIGS[_label] = {
-                "obj":  os.path.join(DATA_DIR, _base + ".obj"),
-                "gltf": os.path.join(DATA_DIR, _base + ".gltf"),
-            }
+            _versioned_cfgs.append((int(_base[1:]), _base))
+
+for _, _base in sorted(_versioned_cfgs, key=lambda x: x[0]):
+    _label = f"Configuration {_base.upper()}"
+    THRUSTER_CONFIGS[_label] = {
+        "obj":  os.path.join(DATA_DIR, _base + ".obj"),
+        "gltf": os.path.join(DATA_DIR, _base + ".gltf"),
+    }
 
 # Legacy "Assembly 1" as fallback if present
 _legacy_obj = os.path.join(DATA_DIR, "Assembly 1.obj")
@@ -330,6 +369,10 @@ if os.path.exists(_legacy_obj) and os.path.exists(_legacy_gltf):
         "obj":  _legacy_obj,
         "gltf": _legacy_gltf,
     }
+
+# Explicit legacy configurations policy: add config names here to hide behind legacy button.
+# Remains empty by default; user specifies which configs are legacy (not auto-detected by name).
+LEGACY_CONFIGS = set()  # e.g., {"Assembly 1 (Legacy)"}  — add names here to hide them in a 'Legacy' category
 
 # Active configuration — defaults to first available; overwritten by selector
 _config_names = list(THRUSTER_CONFIGS.keys())
@@ -406,6 +449,152 @@ REC_SAVE_DIR    = os.path.expanduser("~/Downloads")  # where MP4s are saved
 
 # Backwards thrust scaling: DDR says 4.45N reverse vs 5.56N forward ≈ 0.80
 BACKWARDS_THRUST_SCALE = 0.80
+
+# ============================================
+# ENVIRONMENT PRESETS
+# ============================================
+# Each preset defines water/current/pool parameters.  The active preset is
+# applied at startup (and can be changed via the config selector).
+ENVIRONMENT_PRESETS = {
+    "pool": {
+        "label": "Pool / Test Tank",
+        "surface_z": 1.2,
+        "seabed_z": -2.0,
+        "pool_half_x": 3.0,
+        "pool_half_y": 2.0,
+        "current_base": (0.01, 0.005, 0.0),
+        "current_var_amp": (0.005, 0.003, 0.002),
+        "current_var_period": (15.0, 20.0, 25.0),
+        "fog_depth_range": 20.0,
+        "fog_color_surface": (0.15, 0.45, 0.55),
+        "fog_color_deep": (0.04, 0.08, 0.12),
+        "num_risers": 3,
+        "num_obstacles": 0,
+        "description": "Calm indoor pool — minimal current, clear visibility",
+    },
+    "harbor": {
+        "label": "Harbor / Dock",
+        "surface_z": 2.0,
+        "seabed_z": -6.0,
+        "pool_half_x": 8.0,
+        "pool_half_y": 6.0,
+        "current_base": (0.05, 0.03, 0.0),
+        "current_var_amp": (0.03, 0.02, 0.005),
+        "current_var_period": (10.0, 14.0, 18.0),
+        "fog_depth_range": 10.0,
+        "fog_color_surface": (0.12, 0.35, 0.40),
+        "fog_color_deep": (0.03, 0.06, 0.08),
+        "num_risers": 5,
+        "num_obstacles": 3,
+        "description": "Moderate current, reduced visibility, pilings & debris",
+    },
+    "deep_ocean": {
+        "label": "Deep Ocean",
+        "surface_z": 5.0,
+        "seabed_z": -30.0,
+        "pool_half_x": 20.0,
+        "pool_half_y": 20.0,
+        "current_base": (0.08, 0.04, 0.01),
+        "current_var_amp": (0.06, 0.04, 0.02),
+        "current_var_period": (8.0, 12.0, 16.0),
+        "fog_depth_range": 6.0,
+        "fog_color_surface": (0.08, 0.25, 0.35),
+        "fog_color_deep": (0.01, 0.03, 0.05),
+        "num_risers": 0,
+        "num_obstacles": 0,
+        "description": "Deep water — strong current, poor visibility at depth",
+    },
+    "strong_current": {
+        "label": "Strong Current",
+        "surface_z": 1.5,
+        "seabed_z": -4.0,
+        "pool_half_x": 6.0,
+        "pool_half_y": 4.0,
+        "current_base": (0.15, 0.08, 0.0),
+        "current_var_amp": (0.10, 0.06, 0.01),
+        "current_var_period": (6.0, 8.0, 12.0),
+        "fog_depth_range": 12.0,
+        "fog_color_surface": (0.10, 0.35, 0.45),
+        "fog_color_deep": (0.03, 0.06, 0.10),
+        "num_risers": 2,
+        "num_obstacles": 2,
+        "description": "Challenging conditions — tests station-keeping ability",
+    },
+    "training": {
+        "label": "Training",
+        "surface_z": 1.0,
+        "seabed_z": -1.5,
+        "pool_half_x": 2.5,
+        "pool_half_y": 2.0,
+        "current_base": (0.0, 0.0, 0.0),
+        "current_var_amp": (0.0, 0.0, 0.0),
+        "current_var_period": (30.0, 30.0, 30.0),
+        "fog_depth_range": 30.0,
+        "fog_color_surface": (0.18, 0.50, 0.60),
+        "fog_color_deep": (0.10, 0.20, 0.30),
+        "num_risers": 0,
+        "num_obstacles": 0,
+        "description": "No current, shallow, max visibility — learn the controls",
+    },
+}
+ACTIVE_ENVIRONMENT = "pool"  # default preset key
+
+# ============================================
+# ASSIST MODES (operator control aids)
+# ============================================
+# Depth hold: PD controller that holds current depth when engaged
+DEPTH_HOLD_ENABLED = False
+DEPTH_HOLD_KP = 15.0       # N per m of depth error
+DEPTH_HOLD_KD = 8.0        # N per (m/s) of vertical velocity
+DEPTH_HOLD_TARGET = None    # set by toggle key (captures current depth)
+DEPTH_HOLD_MAX_FORCE = 12.0 # N — clamp to prevent runaway
+
+# Heading hold: PD controller that holds current heading when engaged
+HEADING_HOLD_ENABLED = False
+HEADING_HOLD_KP = 4.0      # N·m per rad of heading error
+HEADING_HOLD_KD = 2.0      # N·m per (rad/s) of yaw rate
+HEADING_HOLD_TARGET = None  # set by toggle key (captures current heading)
+HEADING_HOLD_MAX_TORQUE = 5.0  # N·m — clamp
+
+# Station keeping: depth hold + heading hold combined
+# (activated separately or via a combined toggle)
+
+# ============================================
+# INPUT CURVES & JOYSTICK CONFIGURATION
+# ============================================
+# Proportional mode: when True, joystick outputs continuous -1..+1 instead
+# of snapping to binary -1/0/+1.  Thruster spool dynamics still apply.
+PROPORTIONAL_MODE = False
+
+# Input curve exponent: >1 gives more precision near centre, <1 more at edges
+# Applied as: output = sign(input) * |input|^exponent
+INPUT_CURVE_EXPONENT = 1.5
+
+# Deadzone: stick displacement below this fraction is treated as zero
+INPUT_DEADZONE = 0.15
+
+# Rate limit: maximum change in command per second (0=unlimited)
+INPUT_RATE_LIMIT = 0.0  # commands/sec (0 = no limit, instant)
+
+# ============================================
+# TIMING / PERFORMANCE METRICS
+# ============================================
+SHOW_TIMING_METRICS = True     # print FPS / step-time periodically
+TIMING_REPORT_INTERVAL = 5.0   # seconds between timing reports
+
+# ============================================
+# THRUSTER FAILURE SIMULATION
+# ============================================
+THRUSTER_FAILURE_ENABLED = False
+THRUSTER_FAILURE_PROB = 0.0     # probability per second of a thruster failing
+THRUSTER_FAILED = []            # list of bools, set at runtime
+THRUSTER_FAILURE_DURATION = 0.0 # seconds (0 = permanent until reset)
+
+# ============================================
+# DEBUG VISUALIZATION
+# ============================================
+SHOW_FORCE_VECTORS = False   # draw thrust/drag/buoyancy vectors in 3D view
+FORCE_VECTOR_SCALE = 0.05    # meters per Newton for visualization
 
 # Obstacles (movable props) — also treated as neutrally-buoyant objects in water
 NUM_OBSTACLES = 0                          # Set to 0 to disable random objects
@@ -490,7 +679,7 @@ def _safe_camera_rgba(raw_pixels, width, height):
         # tuple, list, or bytes — convert to array then reshape
         arr = np.array(raw_pixels, dtype=np.uint8)
         return arr.reshape(height, width, 4)
-    except Exception:
+    except (ValueError, TypeError, AttributeError):
         return None
 
 def mat4_mul(a, b):
@@ -582,25 +771,204 @@ def find_first_transform_descendant(nodes, root_idx):
     return best
 
 def obj_bounds(path):
-    vmin = [1e9, 1e9, 1e9]
-    vmax = [-1e9, -1e9, -1e9]
-    found = False
+    # Parse vertices and face connectivity so we can ignore disconnected mesh
+    # components that are far from the main ROV body (common CAD export artifact).
+    vertices = []
+    face_vertex_lists = []
+
     with open(path, "r", errors="ignore") as f:
         for line in f:
             if line.startswith("v "):
                 parts = line.strip().split()
                 if len(parts) >= 4:
                     try:
-                        x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                        vertices.append((float(parts[1]), float(parts[2]), float(parts[3])))
                     except ValueError:
                         continue
-                    found = True
-                    vmin[0] = min(vmin[0], x); vmin[1] = min(vmin[1], y); vmin[2] = min(vmin[2], z)
-                    vmax[0] = max(vmax[0], x); vmax[1] = max(vmax[1], y); vmax[2] = max(vmax[2], z)
-    if not found:
+            elif line.startswith("f "):
+                tokens = line.strip().split()[1:]
+                face_idxs = []
+                for tok in tokens:
+                    vtok = tok.split("/")[0]
+                    if not vtok:
+                        continue
+                    try:
+                        idx = int(vtok)
+                    except ValueError:
+                        continue
+                    if idx < 0:
+                        idx = len(vertices) + idx + 1
+                    if 1 <= idx <= len(vertices):
+                        face_idxs.append(idx - 1)
+                if len(face_idxs) >= 3:
+                    face_vertex_lists.append(face_idxs)
+
+    if not vertices:
         center = (0.0, 0.0, 0.0)
         size = (0.4, 0.4, 0.25)
         return center, size
+
+    # If we have no faces, fall back to all-vertex bounds.
+    if not face_vertex_lists:
+        vmin = [1e9, 1e9, 1e9]
+        vmax = [-1e9, -1e9, -1e9]
+        for x, y, z in vertices:
+            vmin[0] = min(vmin[0], x); vmin[1] = min(vmin[1], y); vmin[2] = min(vmin[2], z)
+            vmax[0] = max(vmax[0], x); vmax[1] = max(vmax[1], y); vmax[2] = max(vmax[2], z)
+        center = ((vmin[0]+vmax[0])/2, (vmin[1]+vmax[1])/2, (vmin[2]+vmax[2])/2)
+        size = (vmax[0]-vmin[0], vmax[1]-vmin[1], vmax[2]-vmin[2])
+        return center, size
+
+    # Union-find over face-connected vertices.
+    parent = {}
+    rank = {}
+
+    def uf_make(i):
+        if i not in parent:
+            parent[i] = i
+            rank[i] = 0
+
+    def uf_find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def uf_union(a, b):
+        ra = uf_find(a)
+        rb = uf_find(b)
+        if ra == rb:
+            return
+        if rank[ra] < rank[rb]:
+            parent[ra] = rb
+        elif rank[ra] > rank[rb]:
+            parent[rb] = ra
+        else:
+            parent[rb] = ra
+            rank[ra] += 1
+
+    for face in face_vertex_lists:
+        base = face[0]
+        uf_make(base)
+        for vi in face[1:]:
+            uf_make(vi)
+            uf_union(base, vi)
+
+    components = {}
+    for vi in parent:
+        root = uf_find(vi)
+        components.setdefault(root, []).append(vi)
+
+    # Compute per-component stats.
+    comp_stats = []
+    for _, idxs in components.items():
+        vmin = [1e9, 1e9, 1e9]
+        vmax = [-1e9, -1e9, -1e9]
+        for vi in idxs:
+            x, y, z = vertices[vi]
+            vmin[0] = min(vmin[0], x); vmin[1] = min(vmin[1], y); vmin[2] = min(vmin[2], z)
+            vmax[0] = max(vmax[0], x); vmax[1] = max(vmax[1], y); vmax[2] = max(vmax[2], z)
+        cx = (vmin[0] + vmax[0]) / 2
+        cy = (vmin[1] + vmax[1]) / 2
+        cz = (vmin[2] + vmax[2]) / 2
+        sx = (vmax[0] - vmin[0])
+        sy = (vmax[1] - vmin[1])
+        sz = (vmax[2] - vmin[2])
+        diag = math.sqrt(sx*sx + sy*sy + sz*sz)
+        comp_stats.append({
+            "idxs": idxs,
+            "count": len(idxs),
+            "center": (cx, cy, cz),
+            "diag": diag,
+            "vmin": vmin,
+            "vmax": vmax,
+        })
+
+    # Main body = largest face-connected component.
+    comp_stats.sort(key=lambda c: c["count"], reverse=True)
+    main = comp_stats[0]
+    main_c = main["center"]
+    keep_components = [main]
+
+    # Keep nearby components; drop far-out disconnected ones that skew origin.
+    # Threshold scales with main-body size, with a small absolute floor.
+    keep_dist = max(0.75, 2.5 * max(main["diag"], 1e-6))
+    dropped = 0
+    for comp in comp_stats[1:]:
+        c = comp["center"]
+        dist = math.sqrt((c[0]-main_c[0])**2 + (c[1]-main_c[1])**2 + (c[2]-main_c[2])**2)
+        if dist <= keep_dist:
+            keep_components.append(comp)
+        else:
+            dropped += 1
+
+    vmin = [1e9, 1e9, 1e9]
+    vmax = [-1e9, -1e9, -1e9]
+    kept_vertex_count = 0
+    for comp in keep_components:
+        cmin = comp["vmin"]
+        cmax = comp["vmax"]
+        kept_vertex_count += comp["count"]
+        vmin[0] = min(vmin[0], cmin[0]); vmin[1] = min(vmin[1], cmin[1]); vmin[2] = min(vmin[2], cmin[2])
+        vmax[0] = max(vmax[0], cmax[0]); vmax[1] = max(vmax[1], cmax[1]); vmax[2] = max(vmax[2], cmax[2])
+
+    # Robustly trim the outer tails so sparse far geometry does not skew the
+    # center/collision box, while preserving the dense main frame.
+    TRIM_FRAC = 0.04
+    MIN_VERTS_FOR_TRIM = 5000
+    if kept_vertex_count >= MIN_VERTS_FOR_TRIM:
+        xs = []
+        ys = []
+        zs = []
+        for comp in keep_components:
+            for vi in comp["idxs"]:
+                x, y, z = vertices[vi]
+                xs.append(x)
+                ys.append(y)
+                zs.append(z)
+
+        xs.sort()
+        ys.sort()
+        zs.sort()
+
+        n = len(xs)
+        lo = int(n * TRIM_FRAC)
+        hi = n - lo - 1
+        if 0 <= lo < hi < n:
+            tvmin = [xs[lo], ys[lo], zs[lo]]
+            tvmax = [xs[hi], ys[hi], zs[hi]]
+
+            raw_center = ((vmin[0] + vmax[0]) / 2, (vmin[1] + vmax[1]) / 2, (vmin[2] + vmax[2]) / 2)
+            med_center = (xs[n // 2], ys[n // 2], zs[n // 2])
+            raw_size = (max(vmax[0] - vmin[0], 1e-9), max(vmax[1] - vmin[1], 1e-9), max(vmax[2] - vmin[2], 1e-9))
+            center_shift = (
+                abs(raw_center[0] - med_center[0]),
+                abs(raw_center[1] - med_center[1]),
+                abs(raw_center[2] - med_center[2]),
+            )
+
+            # Trigger trimming only when one axis is clearly skewed by a tail.
+            skewed = any(
+                (center_shift[i] > 0.02) and ((center_shift[i] / raw_size[i]) > 0.10)
+                for i in range(3)
+            )
+
+            # Use trimmed bounds only if they remain physically close to raw
+            # bounds size (avoid over-shrinking tiny or pathological meshes).
+            raw_sx = max(vmax[0] - vmin[0], 1e-9)
+            raw_sy = max(vmax[1] - vmin[1], 1e-9)
+            raw_sz = max(vmax[2] - vmin[2], 1e-9)
+            trim_sx = max(tvmax[0] - tvmin[0], 0.0)
+            trim_sy = max(tvmax[1] - tvmin[1], 0.0)
+            trim_sz = max(tvmax[2] - tvmin[2], 0.0)
+
+            if skewed and (trim_sx / raw_sx) > 0.55 and (trim_sy / raw_sy) > 0.55 and (trim_sz / raw_sz) > 0.55:
+                vmin = tvmin
+                vmax = tvmax
+
+    if dropped > 0:
+        print(f"[INFO] Ignored {dropped} far disconnected mesh component(s) in {os.path.basename(path)}.")
+
     center = ((vmin[0]+vmax[0])/2, (vmin[1]+vmax[1])/2, (vmin[2]+vmax[2])/2)
     size = (vmax[0]-vmin[0], vmax[1]-vmin[1], vmax[2]-vmin[2])
     return center, size
@@ -630,7 +998,7 @@ def find_camera_pose_from_gltf(gltf_path, center):
     try:
         with open(gltf_path, "r", errors="ignore") as f:
             gltf = json.load(f)
-    except Exception:
+    except (OSError, json.JSONDecodeError, ValueError):
         return None
 
     nodes = gltf.get("nodes", []) or []
@@ -734,7 +1102,7 @@ def detect_thrusters_from_gltf(gltf_path, center):
     try:
         with open(gltf_path, "r", errors="ignore") as f:
             gltf = json.load(f)
-    except Exception:
+    except (OSError, json.JSONDecodeError, ValueError):
         return []
 
     nodes = gltf.get("nodes", []) or []
@@ -823,18 +1191,203 @@ def detect_thrusters_from_gltf(gltf_path, center):
 # ==========================
 # CONFIGURATION SELECTOR
 # ==========================
+
+# ── Color palette (dark professional theme) ──────────────────────
+_CS = {
+    "bg":       "#0f1724",
+    "card":     "#162032",
+    "card_bd":  "#2a3a52",
+    "canvas":   "#0a1018",
+    "grid":     "#131c28",
+    "body":     "#1e2d42",
+    "body_bd":  "#3d5a80",
+    "frame":    "#243447",
+    "thr_h":    "#f59e0b",
+    "thr_h_bg": "#2d1a00",
+    "thr_v":    "#3b82f6",
+    "thr_v_bg": "#0f2744",
+    "fwd":      "#10b981",
+    "angle":    "#ef4444",
+    "text":     "#e2e8f0",
+    "dim":      "#7a8a9e",
+    "btn":      "#2563eb",
+    "btn_hvr":  "#1d4ed8",
+    "btn_txt":  "#ffffff",
+    "launch_bg": "#ffb703",
+    "launch_bg_hvr": "#ffcb47",
+    "launch_txt": "#1f2937",
+    "legacy_bg": "#334155",
+    "legacy_bg_hvr": "#475569",
+    "legacy_txt": "#e2e8f0",
+    "label":    "#94a3b8",
+    "nose":     "#29584d",
+    "com":      "#64748b",
+    "com_bd":   "#94a3b8",
+    "sep":      "#1e2d3d",
+    "stat_v":   "#cbd5e1",
+}
+
+
+def _cfg_draw_schematic(canvas, info, cw, ch):
+    """Draw a top-down ROV schematic with thruster vectors on a tk.Canvas."""
+    C = _CS
+    thrusters = info["thrusters"]
+    size = info["size"]
+
+    # ── Coordinate mapping: mesh → screen ──
+    # Mesh: X=right, -Y=forward, Z=up.  Screen: X=right, Y=down.
+    # So screen_x = mesh_x, screen_y = mesh_y (positive mesh Y = rear = down).
+    margin = 58
+    usable = min(cw, ch) - 2 * margin
+    max_ext = max(size[0], size[1], 0.2)
+    scale = usable / max_ext * 0.62
+    ox, oy = cw / 2, ch / 2 + 12  # offset down a bit for FWD label room
+
+    def m2s(mx, my):
+        return ox + mx * scale, oy + my * scale
+
+    # ── Grid ──
+    gs = 28
+    for gx in range(0, cw + gs, gs):
+        canvas.create_line(gx, 0, gx, ch, fill=C["grid"])
+    for gy in range(0, ch + gs, gs):
+        canvas.create_line(0, gy, cw, gy, fill=C["grid"])
+
+    # ── ROV body outline ──
+    hx = size[0] / 2 * scale
+    hy = size[1] / 2 * scale
+
+    # Tapered nose polygon for forward end
+    nose_inset = hx * 0.30
+    nose_ext   = hy * 0.18
+    body_pts = [
+        ox,            oy - hy - nose_ext,   # nose tip (front)
+        ox + hx - nose_inset, oy - hy,       # front-right shoulder
+        ox + hx,              oy - hy * 0.5,  # upper-right
+        ox + hx,              oy + hy,        # rear-right
+        ox - hx,              oy + hy,        # rear-left
+        ox - hx,              oy - hy * 0.5,  # upper-left
+        ox - hx + nose_inset, oy - hy,       # front-left shoulder
+    ]
+    canvas.create_polygon(body_pts, fill=C["body"], outline=C["body_bd"],
+                          width=2, smooth=False)
+
+    # Internal frame cross-members (visual detail)
+    for frac in (-0.35, 0.0, 0.35):
+        y = oy + frac * hy * 2
+        canvas.create_line(ox - hx * 0.75, y, ox + hx * 0.75, y,
+                           fill=C["frame"], width=1, dash=(4, 4))
+    canvas.create_line(ox, oy - hy * 0.45, ox, oy + hy * 0.85,
+                       fill=C["frame"], width=1, dash=(4, 4))
+
+    # ── Forward direction indicator ──
+    fwd_base_y = oy - hy - nose_ext - 4
+    fwd_tip_y  = fwd_base_y - 28
+    canvas.create_line(ox, fwd_base_y, ox, fwd_tip_y, fill=C["fwd"],
+                       width=2, arrow="last", arrowshape=(8, 10, 4))
+    canvas.create_text(ox, fwd_tip_y - 11, text="FWD", fill=C["fwd"],
+                       font=("Helvetica", 9, "bold"))
+
+    # ── Centre of mass crosshair ──
+    cr = 5
+    canvas.create_line(ox - cr, oy, ox + cr, oy, fill=C["com_bd"], width=1)
+    canvas.create_line(ox, oy - cr, ox, oy + cr, fill=C["com_bd"], width=1)
+    canvas.create_oval(ox - 3, oy - 3, ox + 3, oy + 3,
+                       fill=C["com"], outline=C["com_bd"])
+
+    # ── "REAR" label at the bottom of body ──
+    canvas.create_text(ox, oy + hy + 14, text="REAR", fill=C["dim"],
+                       font=("Helvetica", 7))
+
+    # ── Thrusters ──
+    for t in thrusters:
+        px, py = m2s(t["pos"][0], t["pos"][1])
+        tnum = t["name"][-1]  # "1"–"4"
+
+        if t["kind"] == "V":
+            # Vertical thruster: circle + heave arrow icon
+            vr = 11
+            canvas.create_oval(px - vr, py - vr, px + vr, py + vr,
+                               fill=C["thr_v_bg"], outline=C["thr_v"], width=2)
+            # up-arrow glyph drawn manually (more reliable than unicode)
+            canvas.create_line(px, py + 4, px, py - 5, fill=C["thr_v"],
+                               width=2, arrow="last", arrowshape=(5, 6, 3))
+            canvas.create_text(px, py + vr + 12, text=f"T{tnum}",
+                               fill=C["thr_v"], font=("Helvetica", 9, "bold"))
+            canvas.create_text(px, py + vr + 24, text="HEAVE",
+                               fill=C["dim"], font=("Helvetica", 7))
+        else:
+            # Horizontal thruster: position dot + thrust direction arrow
+            hr = 7
+            canvas.create_oval(px - hr, py - hr, px + hr, py + hr,
+                               fill=C["thr_h_bg"], outline=C["thr_h"], width=2)
+
+            # Thrust direction arrow
+            arrow_len = 55
+            dx = t["dir"][0] * arrow_len
+            dy = t["dir"][1] * arrow_len
+            canvas.create_line(px, py, px + dx, py + dy,
+                               fill=C["thr_h"], width=3, arrow="last",
+                               arrowshape=(10, 13, 5))
+
+            # Thruster label (offset away from body centre)
+            is_left  = t["pos"][0] < -0.03
+            is_right = t["pos"][0] > 0.03
+            if is_left:
+                lx, anc = px - hr - 7, "e"
+            elif is_right:
+                lx, anc = px + hr + 7, "w"
+            else:
+                lx, anc = px + hr + 7, "w"
+            canvas.create_text(lx, py, text=f"T{tnum}",
+                               fill=C["thr_h"], font=("Helvetica", 9, "bold"),
+                               anchor=anc)
+
+            # ── Angle arc annotation (only for off-centreline thrusters) ──
+            if abs(t["pos"][0]) > 0.05:
+                # Angle between thrust direction and forward (-Y in mesh)
+                # Using tkinter angle convention: 0°=east, 90°=north, CCW+
+                arrow_tk_angle = math.degrees(math.atan2(-dy, dx))
+                angle_diff = arrow_tk_angle - 90.0  # deviation from forward (90°)
+                abs_angle = abs(angle_diff)
+
+                if abs_angle > 2.0:
+                    arc_r = 28
+                    # Arc from forward (90°) sweeping toward arrow direction
+                    if angle_diff > 0:  # left side
+                        start_a = 90.0
+                        extent_a = angle_diff
+                    else:               # right side
+                        start_a = 90.0
+                        extent_a = angle_diff  # negative = clockwise
+
+                    canvas.create_arc(
+                        px - arc_r, py - arc_r, px + arc_r, py + arc_r,
+                        start=start_a, extent=extent_a,
+                        style="arc", outline=C["angle"], width=2)
+
+                    # Dashed reference line straight "up" from thruster (forward ref)
+                    canvas.create_line(px, py, px, py - arc_r - 4,
+                                       fill=C["dim"], width=1, dash=(3, 3))
+
+                    # Angle value label at midpoint of arc
+                    mid_rad = math.radians(90.0 + angle_diff / 2)
+                    lr = arc_r + 16
+                    lx2 = px + lr * math.cos(mid_rad)
+                    ly2 = py - lr * math.sin(mid_rad)
+                    canvas.create_text(lx2, ly2, text=f"{abs_angle:.1f}\u00b0",
+                                       fill=C["angle"],
+                                       font=("Helvetica", 10, "bold"))
+
+
 def choose_thruster_config():
     """
-    Show a Tkinter dialog before the sim starts so the user can pick
-    which thruster configuration (CAD model) to simulate.
-
-    Sets the module-level OBJ_FILE and GLTF_FILE globals.
-    Returns the chosen config name, or None if the user cancelled.
+    Professional Tkinter configuration selector with schematic renderings
+    of each thruster layout, highlighting angle differences and key metrics.
     """
     global OBJ_FILE, GLTF_FILE, ACTIVE_CONFIG_NAME
 
     if len(THRUSTER_CONFIGS) <= 1:
-        # Only one (or zero) config available — nothing to choose
         if THRUSTER_CONFIGS:
             name = list(THRUSTER_CONFIGS.keys())[0]
             OBJ_FILE  = THRUSTER_CONFIGS[name]["obj"]
@@ -845,34 +1398,273 @@ def choose_thruster_config():
 
     import tkinter as tk
 
+    # ── Pre-analyse each configuration (with exception protection) ────────────────────────────
+    config_info = {}
+    for name, cfg in THRUSTER_CONFIGS.items():
+        try:
+            center, size = obj_bounds(cfg["obj"])
+            thrusters = detect_thrusters_from_gltf(cfg["gltf"], center)
+            h_thrs = [t for t in thrusters if t["kind"] == "H"]
+
+            # Outboard angles for angled rear thrusters (off-centreline)
+            rear_angles = []
+            for t in h_thrs:
+                if abs(t["pos"][0]) > 0.05:
+                    rear_angles.append(
+                        math.degrees(math.atan2(abs(t["dir"][0]), abs(t["dir"][1]))))
+            avg_angle = sum(rear_angles) / len(rear_angles) if rear_angles else 0.0
+
+            # Total forward thrust when all H thrusters fire at 100%
+            total_fwd = sum(abs(t["dir"][1]) for t in h_thrs) * MAX_THRUST_H
+
+            # Yaw torque estimate: lateral force component × moment arm
+            yaw_torque = 0.0
+            for t in h_thrs:
+                if abs(t["pos"][0]) > 0.05:
+                    yaw_torque += abs(t["dir"][0]) * MAX_THRUST_H * abs(t["pos"][1])
+
+            # Descriptive tag
+            if avg_angle > 30:
+                desc = "Wide-angle layout — strong yaw authority,\nmoderate forward thrust"
+            elif avg_angle > 15:
+                desc = "Narrow-angle layout — maximum forward\nthrust, moderate yaw authority"
+            else:
+                desc = "Straight layout — pure forward thrust,\nminimal yaw authority"
+
+            config_info[name] = {
+                "thrusters":     thrusters,
+                "size":          size,
+                "total_fwd_N":   total_fwd,
+                "avg_angle":     avg_angle,
+                "yaw_torque_Nm": yaw_torque,
+                "n_h":           len(h_thrs),
+                "n_v":           len([t for t in thrusters if t["kind"] == "V"]),
+                "description":   desc,
+            }
+        except (ValueError, KeyError, pybullet.error) as e:
+            print(f"⚠️  Pre-analysis of '{name}' failed: {e} — skipping from selector")
+            config_info[name] = None  # Mark as failed to skip rendering
+
+    C = _CS
+    # Split configs using explicit LEGACY_CONFIGS policy (manual, not name-based)
+    primary_configs = [(name, cfg) for name, cfg in THRUSTER_CONFIGS.items() if name not in LEGACY_CONFIGS and config_info.get(name) is not None]
+    legacy_configs = [(name, cfg) for name, cfg in THRUSTER_CONFIGS.items() if name in LEGACY_CONFIGS and config_info.get(name) is not None]
+
+    # Fallback: if no primary configs due to all being legacy OR all failing analysis, show all non-failed
+    if not primary_configs:
+        primary_configs = [(name, cfg) for name, cfg in THRUSTER_CONFIGS.items() if config_info.get(name) is not None]
+
     chosen = [None]
 
+    # ── Window ───────────────────────────────────────────────────
     root = tk.Tk()
-    root.title("ROV Thruster Configuration")
+    root.title("ROV Simulator \u2014 Thruster Configuration")
+    root.configure(bg=C["bg"])
     root.resizable(False, False)
 
-    # Center on screen
-    win_w, win_h = 380, 60 + 48 * len(THRUSTER_CONFIGS)
-    sx = root.winfo_screenwidth() // 2 - win_w // 2
-    sy = root.winfo_screenheight() // 2 - win_h // 2
-    root.geometry(f"{win_w}x{win_h}+{sx}+{sy}")
+    n = len(primary_configs)
+    CARD_W   = 310 if n <= 3 else 260
+    CANVAS_H = 280
+    PAD      = 14
+    WIN_PAD  = 22
+    WIN_W    = n * CARD_W + (n + 1) * PAD + 2 * WIN_PAD
+    WIN_H    = 600
+    sx = root.winfo_screenwidth()  // 2 - WIN_W // 2
+    sy = root.winfo_screenheight() // 2 - WIN_H // 2
+    root.geometry(f"{WIN_W}x{WIN_H}+{sx}+{sy}")
 
-    tk.Label(root, text="Select thruster configuration:",
-             font=("Helvetica", 14, "bold")).pack(pady=(12, 6))
+    # ── Title bar ────────────────────────────────────────────────
+    hdr = tk.Frame(root, bg=C["bg"])
+    hdr.pack(fill="x", padx=WIN_PAD, pady=(WIN_PAD, 0))
+    tk.Label(hdr, text="Thruster Configuration",
+             font=("Helvetica", 18, "bold"), fg=C["text"], bg=C["bg"]
+             ).pack(side="left")
+    subtitle = "Select a layout to simulate"
+    if legacy_configs:
+        subtitle += " — legacy layouts are in the button below"
+    tk.Label(hdr, text=subtitle,
+             font=("Helvetica", 11), fg=C["dim"], bg=C["bg"]
+             ).pack(side="left", padx=(14, 0), pady=(5, 0))
+
+    # Separator
+    tk.Frame(root, height=1, bg=C["card_bd"]).pack(fill="x", padx=WIN_PAD,
+                                                    pady=(10, 12))
+
+    # ── Cards container ──────────────────────────────────────────
+    cards = tk.Frame(root, bg=C["bg"])
+    cards.pack(fill="both", expand=True, padx=WIN_PAD)
 
     def _pick(name):
         chosen[0] = name
         root.destroy()
 
-    for name in THRUSTER_CONFIGS:
-        btn = tk.Button(root, text=name, font=("Helvetica", 12),
-                        width=30, height=1,
-                        command=lambda n=name: _pick(n))
-        btn.pack(pady=4)
+    def _bind_hover(widget, base_bg, hover_bg):
+        widget.bind("<Enter>", lambda _e: widget.configure(bg=hover_bg))
+        widget.bind("<Leave>", lambda _e: widget.configure(bg=base_bg))
 
-    root.protocol("WM_DELETE_WINDOW", root.destroy)  # X button = cancel
+    def _bind_hover_pair(frame_widget, label_widget, base_bg, hover_bg):
+        frame_widget.bind("<Enter>", lambda _e: (frame_widget.configure(bg=hover_bg), label_widget.configure(bg=hover_bg)))
+        frame_widget.bind("<Leave>", lambda _e: (frame_widget.configure(bg=base_bg), label_widget.configure(bg=base_bg)))
+        label_widget.bind("<Enter>", lambda _e: (frame_widget.configure(bg=hover_bg), label_widget.configure(bg=hover_bg)))
+        label_widget.bind("<Leave>", lambda _e: (frame_widget.configure(bg=base_bg), label_widget.configure(bg=base_bg)))
+
+    def _open_legacy_dialog():
+        dlg = tk.Toplevel(root)
+        dlg.title("Legacy Configurations")
+        dlg.configure(bg=C["bg"])
+        dlg.resizable(False, False)
+        dlg.transient(root)
+        dlg.grab_set()
+
+        dk_w = 520
+        dk_h = 80 + 64 * max(1, len(legacy_configs))
+        dsx = dlg.winfo_screenwidth() // 2 - dk_w // 2
+        dsy = dlg.winfo_screenheight() // 2 - dk_h // 2
+        dlg.geometry(f"{dk_w}x{dk_h}+{dsx}+{dsy}")
+
+        tk.Label(
+            dlg,
+            text="Choose a legacy layout",
+            font=("Helvetica", 14, "bold"),
+            fg=C["text"],
+            bg=C["bg"],
+        ).pack(anchor="w", padx=16, pady=(14, 6))
+
+        if not legacy_configs:
+            tk.Label(
+                dlg,
+                text="No legacy configurations found.",
+                font=("Helvetica", 11),
+                fg=C["dim"],
+                bg=C["bg"],
+            ).pack(anchor="w", padx=16, pady=(4, 10))
+            return
+
+        for name, _ in legacy_configs:
+            row = tk.Frame(dlg, bg=C["bg"])
+            row.pack(fill="x", padx=16, pady=6)
+
+            btn = tk.Frame(row, bg=C["legacy_bg"], cursor="hand2", highlightthickness=0)
+            btn.pack(fill="x")
+            lbl = tk.Label(
+                btn,
+                text=f"Enter {name}",
+                font=("Helvetica", 11, "bold"),
+                fg=C["legacy_txt"],
+                bg=C["legacy_bg"],
+                padx=12,
+                pady=8,
+            )
+            lbl.pack(fill="x")
+
+            def _pick_legacy(_e=None, nm=name):
+                chosen[0] = nm
+                dlg.destroy()
+                root.destroy()
+
+            btn.bind("<Button-1>", _pick_legacy)
+            lbl.bind("<Button-1>", _pick_legacy)
+            _bind_hover_pair(btn, lbl, C["legacy_bg"], C["legacy_bg_hvr"])
+
+    for col, (name, _) in enumerate(primary_configs):
+        info = config_info.get(name)
+        if info is None:
+            continue  # Skip configs that failed pre-analysis
+
+        # Card frame
+        card = tk.Frame(cards, bg=C["card"], highlightbackground=C["card_bd"],
+                        highlightthickness=1)
+        card.grid(row=0, column=col, padx=PAD // 2, sticky="nsew")
+        # inner padding frame
+        inner = tk.Frame(card, bg=C["card"])
+        inner.pack(fill="both", expand=True, padx=14, pady=12)
+
+        # Config name
+        tk.Label(inner, text=name, font=("Helvetica", 13, "bold"),
+                 fg=C["text"], bg=C["card"]).pack(anchor="w")
+
+        # Thin accent line under title
+        tk.Frame(inner, height=2, bg=C["thr_h"]).pack(fill="x", pady=(4, 10))
+
+        # ── Canvas (schematic) ──
+        cv_w = CARD_W - 52
+        cv = tk.Canvas(inner, width=cv_w, height=CANVAS_H,
+                       bg=C["canvas"], highlightthickness=0, bd=0)
+        cv.pack()
+        _cfg_draw_schematic(cv, info, cv_w, CANVAS_H)
+
+        # ── Stats rows ──
+        sf = tk.Frame(inner, bg=C["card"])
+        sf.pack(fill="x", pady=(12, 0))
+
+        stats = [
+            ("T1 / T2 Angle",  f"{info['avg_angle']:.1f}\u00b0 outboard"),
+            ("Forward Thrust",  f"{info['total_fwd_N']:.1f} N"),
+            ("Yaw Torque",      f"{info['yaw_torque_Nm']:.2f} N\u00b7m"),
+            ("Thrusters",       f"{info['n_h']}H + {info['n_v']}V"),
+        ]
+        for lbl, val in stats:
+            row = tk.Frame(sf, bg=C["card"])
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=lbl, font=("Helvetica", 10),
+                     fg=C["label"], bg=C["card"]).pack(side="left")
+            tk.Label(row, text=val, font=("Helvetica", 10, "bold"),
+                     fg=C["stat_v"], bg=C["card"]).pack(side="right")
+
+        # Description
+        tk.Label(inner, text=info["description"],
+                 font=("Helvetica", 9), fg=C["dim"], bg=C["card"],
+                 justify="left", anchor="w").pack(fill="x", pady=(8, 0))
+
+        # ── Select button (custom widget for consistent color on macOS) ──
+        short = name.split()[-1]  # "V1", "V2", etc.
+        launch_btn = tk.Frame(inner, bg=C["launch_bg"], cursor="hand2", highlightthickness=0)
+        launch_btn.pack(fill="x", pady=(12, 0))
+        launch_lbl = tk.Label(
+            launch_btn,
+            text=f"\u25b6   Launch {short}",
+            font=("Helvetica", 12, "bold"),
+            fg=C["launch_txt"],
+            bg=C["launch_bg"],
+            padx=8,
+            pady=7,
+        )
+        launch_lbl.pack(fill="x")
+
+        launch_btn.bind("<Button-1>", lambda _e, nm=name: _pick(nm))
+        launch_lbl.bind("<Button-1>", lambda _e, nm=name: _pick(nm))
+        _bind_hover_pair(launch_btn, launch_lbl, C["launch_bg"], C["launch_bg_hvr"])
+
+    for i in range(n):
+        cards.columnconfigure(i, weight=1)
+
+    if legacy_configs:
+        legacy_row = tk.Frame(root, bg=C["bg"])
+        legacy_row.pack(fill="x", padx=WIN_PAD, pady=(8, 14))
+
+        legacy_btn = tk.Frame(legacy_row, bg=C["legacy_bg"], cursor="hand2", highlightthickness=0)
+        legacy_btn.pack(side="left")
+        legacy_lbl = tk.Label(
+            legacy_btn,
+            text="Legacy Configurations",
+            font=("Helvetica", 11, "bold"),
+            fg=C["legacy_txt"],
+            bg=C["legacy_bg"],
+            padx=12,
+            pady=8,
+        )
+        legacy_lbl.pack()
+
+        legacy_btn.bind("<Button-1>", lambda _e: _open_legacy_dialog())
+        legacy_lbl.bind("<Button-1>", lambda _e: _open_legacy_dialog())
+        _bind_hover_pair(legacy_btn, legacy_lbl, C["legacy_bg"], C["legacy_bg_hvr"])
+
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
     root.lift()
-    root.attributes("-topmost", True)
+    try:
+        root.attributes("-topmost", True)
+    except (AttributeError, RuntimeError) as e:
+        print(f"⚠️  Could not set window topmost attribute (macOS quirk): {e}")
     root.mainloop()
 
     if chosen[0] is None:
@@ -1010,7 +1802,7 @@ def apply_hydrodynamic_forces(body_id, base_pos, base_quat, lin_world, ang_world
         ax_raw = (u - LAST_VREL_BODY[0]) / DT
         ay_raw = (v - LAST_VREL_BODY[1]) / DT
         az_raw = (w - LAST_VREL_BODY[2]) / DT
-    except Exception:
+    except (TypeError, ZeroDivisionError):
         ax_raw = ay_raw = az_raw = 0.0
 
     MAX_ACCEL = 50.0  # m/s² clamp
@@ -1079,7 +1871,7 @@ def apply_hydrodynamic_forces(body_id, base_pos, base_quat, lin_world, ang_world
         alp_x_raw = (pp - LAST_W_BODY[0]) / DT
         alp_y_raw = (q  - LAST_W_BODY[1]) / DT
         alp_z_raw = (r  - LAST_W_BODY[2]) / DT
-    except Exception:
+    except (TypeError, ZeroDivisionError):
         alp_x_raw = alp_y_raw = alp_z_raw = 0.0
 
     MAX_ANG_ACCEL = 100.0
@@ -1119,7 +1911,7 @@ def apply_hydrodynamic_forces(body_id, base_pos, base_quat, lin_world, ang_world
         LAST_A_BODY = (ax, ay, az)
         LAST_W_BODY = (pp, q, r)
         LAST_ALPHA_BODY = (alp_x, alp_y, alp_z)
-    except Exception:
+    except (NameError, TypeError):
         LAST_VREL_BODY = (0.0, 0.0, 0.0)
         LAST_A_BODY = (0.0, 0.0, 0.0)
         LAST_W_BODY = (0.0, 0.0, 0.0)
@@ -1131,6 +1923,254 @@ def apply_hydrodynamic_forces(body_id, base_pos, base_quat, lin_world, ang_world
 apply_drag = apply_hydrodynamic_forces
 
 
+# ============================================
+# ASSIST MODE CONTROLLERS
+# ============================================
+
+def apply_depth_hold(body_id, base_pos, lin_world):
+    """
+    PD depth-hold controller.  Applies a vertical force to maintain the
+    target depth captured when depth hold was engaged.
+
+    Returns the applied force magnitude for telemetry.
+    """
+    global DEPTH_HOLD_TARGET
+    if not DEPTH_HOLD_ENABLED or DEPTH_HOLD_TARGET is None:
+        return 0.0
+    if not p.isConnected():
+        return 0.0
+
+    current_depth = max(0.0, SURFACE_Z - base_pos[2])
+    depth_error = DEPTH_HOLD_TARGET - current_depth  # positive = too shallow, need to go down
+    vz = lin_world[2]  # vertical velocity (positive = up)
+
+    # PD: force = Kp * error - Kd * vz
+    # error > 0 means we're above target depth → need downward force (negative z)
+    # So: f_z = -Kp * error - Kd * vz
+    fz = -DEPTH_HOLD_KP * depth_error - DEPTH_HOLD_KD * vz
+    fz = clamp(fz, -DEPTH_HOLD_MAX_FORCE, DEPTH_HOLD_MAX_FORCE)
+
+    p.applyExternalForce(body_id, -1, (0.0, 0.0, fz), base_pos, p.WORLD_FRAME)
+    return fz
+
+
+def apply_heading_hold(body_id, base_quat, ang_world):
+    """
+    PD heading-hold controller.  Applies a yaw torque to maintain the
+    target heading captured when heading hold was engaged.
+
+    Returns the applied torque magnitude for telemetry.
+    """
+    global HEADING_HOLD_TARGET
+    if not HEADING_HOLD_ENABLED or HEADING_HOLD_TARGET is None:
+        return 0.0
+    if not p.isConnected():
+        return 0.0
+
+    _, _, yaw_current = p.getEulerFromQuaternion(base_quat)
+    # Heading error (wrap to -π..π)
+    heading_error = HEADING_HOLD_TARGET - yaw_current
+    while heading_error > math.pi:
+        heading_error -= 2.0 * math.pi
+    while heading_error < -math.pi:
+        heading_error += 2.0 * math.pi
+
+    # Body-frame yaw rate
+    inv_q = p.invertTransform([0, 0, 0], base_quat)[1]
+    w_body = p.rotateVector(inv_q, ang_world)
+    yaw_rate = w_body[2]
+
+    # PD torque in body frame (z-axis = yaw)
+    tz_b = HEADING_HOLD_KP * heading_error - HEADING_HOLD_KD * yaw_rate
+    tz_b = clamp(tz_b, -HEADING_HOLD_MAX_TORQUE, HEADING_HOLD_MAX_TORQUE)
+
+    # Rotate to world frame and apply
+    t_world = p.rotateVector(base_quat, (0.0, 0.0, tz_b))
+    p.applyExternalTorque(body_id, -1, t_world, p.WORLD_FRAME)
+    return tz_b
+
+
+def apply_environment_preset(preset_key):
+    """
+    Apply an environment preset by updating the relevant global constants.
+    Call before PyBullet world setup.
+    """
+    global SURFACE_Z, SEABED_Z, WATER_CURRENT_BASE, WATER_CURRENT_WORLD
+    global CURRENT_VARIATION_AMP, CURRENT_VARIATION_PERIOD
+    global WATER_FOG_DEPTH_RANGE, WATER_FOG_COLOR_SURFACE, WATER_FOG_COLOR_DEEP
+    global NUM_OBSTACLES, ACTIVE_ENVIRONMENT
+
+    if preset_key not in ENVIRONMENT_PRESETS:
+        print(f"[ENV] Unknown preset '{preset_key}', keeping current settings")
+        return
+
+    preset = ENVIRONMENT_PRESETS[preset_key]
+    SURFACE_Z = preset["surface_z"]
+    SEABED_Z = preset["seabed_z"]
+    WATER_CURRENT_BASE = preset["current_base"]
+    WATER_CURRENT_WORLD = list(WATER_CURRENT_BASE)
+    CURRENT_VARIATION_AMP = preset["current_var_amp"]
+    CURRENT_VARIATION_PERIOD = preset["current_var_period"]
+    WATER_FOG_DEPTH_RANGE = preset["fog_depth_range"]
+    WATER_FOG_COLOR_SURFACE = preset["fog_color_surface"]
+    WATER_FOG_COLOR_DEEP = preset["fog_color_deep"]
+    NUM_OBSTACLES = preset["num_obstacles"]
+    ACTIVE_ENVIRONMENT = preset_key
+    print(f"[ENV] Preset applied: {preset['label']} — {preset['description']}")
+
+
+def create_environment(preset_key=None):
+    """
+    Build the environment (pool, risers, depth markers, etc.) in PyBullet
+    based on the active or specified preset.  Returns a list of body IDs.
+    """
+    if preset_key is not None:
+        apply_environment_preset(preset_key)
+    preset = ENVIRONMENT_PRESETS.get(ACTIVE_ENVIRONMENT, ENVIRONMENT_PRESETS["pool"])
+
+    pool_half_x = preset["pool_half_x"]
+    pool_half_y = preset["pool_half_y"]
+    pool_depth = SURFACE_Z - SEABED_Z
+
+    env_ids = []
+
+    # Seabed collision plane
+    p.loadURDF("plane.urdf", [0, 0, SEABED_Z])
+
+    # Water surface visual indicator
+    try:
+        surface_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[pool_half_x + 2, pool_half_y + 2, 0.002],
+                                           rgbaColor=[0.3, 0.6, 0.8, 0.1])
+        env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=surface_vis,
+                          basePosition=[0, 0, SURFACE_Z]))
+    except pybullet.error:
+        pass
+
+    WALL_THICK = 0.02
+    WALL_COLOR = [0.55, 0.75, 0.85, 0.15]
+    WALL_COLOR_FLOOR = [0.3, 0.28, 0.22, 0.7]
+
+    try:
+        # Pool floor
+        floor_vis = p.createVisualShape(p.GEOM_BOX,
+            halfExtents=[pool_half_x, pool_half_y, 0.02],
+            rgbaColor=WALL_COLOR_FLOOR)
+        env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=floor_vis,
+            basePosition=[0, 0, SEABED_Z + 0.02]))
+
+        # Grid lines
+        grid_step_x = max(1, int(pool_half_x))
+        grid_step_y = max(1, int(pool_half_y))
+        for gx in range(-grid_step_x, grid_step_x + 1):
+            env_ids.append(p.addUserDebugLine(
+                [gx, -pool_half_y, SEABED_Z + 0.03],
+                [gx, pool_half_y, SEABED_Z + 0.03],
+                [0.4, 0.38, 0.32], 1, lifeTime=0))
+        for gy in range(-grid_step_y, grid_step_y + 1):
+            env_ids.append(p.addUserDebugLine(
+                [-pool_half_x, gy, SEABED_Z + 0.03],
+                [pool_half_x, gy, SEABED_Z + 0.03],
+                [0.4, 0.38, 0.32], 1, lifeTime=0))
+
+        # Four walls
+        wall_vis = p.createVisualShape(p.GEOM_BOX,
+            halfExtents=[WALL_THICK, pool_half_y, pool_depth / 2],
+            rgbaColor=WALL_COLOR)
+        env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=wall_vis,
+            basePosition=[pool_half_x, 0, SEABED_Z + pool_depth / 2]))
+        env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=wall_vis,
+            basePosition=[-pool_half_x, 0, SEABED_Z + pool_depth / 2]))
+        wall_vis_side = p.createVisualShape(p.GEOM_BOX,
+            halfExtents=[pool_half_x, WALL_THICK, pool_depth / 2],
+            rgbaColor=WALL_COLOR)
+        env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=wall_vis_side,
+            basePosition=[0, pool_half_y, SEABED_Z + pool_depth / 2]))
+        env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=wall_vis_side,
+            basePosition=[0, -pool_half_y, SEABED_Z + pool_depth / 2]))
+
+        # Risers
+        num_risers = preset.get("num_risers", 0)
+        RISER_RADIUS = 0.08
+        RISER_HEIGHT = pool_depth + 0.3
+        RISER_COLOR = [0.45, 0.42, 0.40, 0.9]
+        RISER_STRIPE = [0.9, 0.6, 0.1, 0.85]
+
+        # Generate riser positions spread across the environment
+        riser_positions = []
+        if num_risers >= 1:
+            riser_positions.append((min(1.5, pool_half_x * 0.5), 0.5, SEABED_Z + RISER_HEIGHT / 2))
+        if num_risers >= 2:
+            riser_positions.append((min(1.5, pool_half_x * 0.5), -0.5, SEABED_Z + RISER_HEIGHT / 2))
+        if num_risers >= 3:
+            riser_positions.append((min(2.0, pool_half_x * 0.6), 0.0, SEABED_Z + RISER_HEIGHT / 2))
+        for ri in range(3, num_risers):
+            rx = min(pool_half_x * 0.7, 1.0 + ri * 0.8)
+            ry = ((-1) ** ri) * (0.3 + ri * 0.2)
+            ry = clamp(ry, -pool_half_y * 0.8, pool_half_y * 0.8)
+            riser_positions.append((rx, ry, SEABED_Z + RISER_HEIGHT / 2))
+
+        for rx, ry, rz in riser_positions:
+            riser_col = p.createCollisionShape(p.GEOM_CYLINDER, radius=RISER_RADIUS, height=RISER_HEIGHT)
+            riser_vis = p.createVisualShape(p.GEOM_CYLINDER, radius=RISER_RADIUS, length=RISER_HEIGHT,
+                                             rgbaColor=RISER_COLOR)
+            rid = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=riser_col,
+                                     baseVisualShapeIndex=riser_vis,
+                                     basePosition=[rx, ry, rz])
+            env_ids.append(rid)
+
+            # Inspection stripe
+            stripe_vis = p.createVisualShape(p.GEOM_CYLINDER,
+                radius=RISER_RADIUS + 0.005, length=0.05,
+                rgbaColor=RISER_STRIPE)
+            env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=stripe_vis,
+                basePosition=[rx, ry, 0.0]))
+
+            # Base flange
+            flange_vis = p.createVisualShape(p.GEOM_CYLINDER,
+                radius=RISER_RADIUS * 1.5, length=0.04,
+                rgbaColor=[0.35, 0.33, 0.30, 0.9])
+            env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=flange_vis,
+                basePosition=[rx, ry, SEABED_Z + 0.04]))
+
+        # Cross-braces between first two risers (if they exist)
+        if len(riser_positions) >= 2:
+            r0 = riser_positions[0]
+            r1 = riser_positions[1]
+            brace_dy = r0[1] - r1[1]
+            brace_dx = r0[0] - r1[0]
+            brace_len = math.sqrt(brace_dx ** 2 + brace_dy ** 2)
+            if brace_len > 0.1:
+                brace_vis = p.createVisualShape(p.GEOM_CYLINDER,
+                    radius=0.025, length=brace_len,
+                    rgbaColor=[0.5, 0.48, 0.44, 0.8])
+                brace_angle = math.atan2(brace_dy, brace_dx)
+                brace_quat = p.getQuaternionFromEuler([math.pi / 2, 0, brace_angle])
+                mid_x = (r0[0] + r1[0]) / 2
+                mid_y = (r0[1] + r1[1]) / 2
+                env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=brace_vis,
+                    basePosition=[mid_x, mid_y, -0.3],
+                    baseOrientation=brace_quat))
+
+        # Depth markers on +Y wall
+        for depth_m in range(0, int(pool_depth) + 1):
+            z_mark = SURFACE_Z - depth_m
+            if z_mark < SEABED_Z:
+                break
+            mark_vis = p.createVisualShape(p.GEOM_BOX,
+                halfExtents=[0.08, 0.002, 0.01],
+                rgbaColor=[1.0, 1.0, 0.2, 0.9] if depth_m % 2 == 0 else [1.0, 0.3, 0.1, 0.9])
+            env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=mark_vis,
+                basePosition=[0, pool_half_y - 0.01, z_mark]))
+
+        print(f"[ENV] Environment: {preset['label']}")
+        print(f"[ENV]   {pool_half_x * 2:.0f}m x {pool_half_y * 2:.0f}m x {pool_depth:.1f}m deep")
+        print(f"[ENV]   {len(riser_positions)} risers, current base={WATER_CURRENT_BASE}")
+    except pybullet.error as env_err:
+        print(f"[ENV] Warning: environment setup error: {env_err}")
+
+    return env_ids
+
+
 # --- Obstacles: neutral buoyancy + drag in water ---
 def apply_obstacle_water_forces(obstacle_ids):
     """Apply neutral buoyancy + drag to obstacles so they behave like objects in water."""
@@ -1140,7 +2180,7 @@ def apply_obstacle_water_forces(obstacle_ids):
         try:
             pos, quat = p.getBasePositionAndOrientation(oid)
             lin, ang = p.getBaseVelocity(oid)
-        except Exception:
+        except pybullet.error:
             continue
 
         # Only apply buoyancy if obstacle is below water surface
@@ -1218,7 +2258,7 @@ def build_rov():
             visualFramePosition=(-center[0], -center[1], -center[2]),
             visualFrameOrientation=(0, 0, 0, 1),
         )
-    except Exception:
+    except pybullet.error:
         vis = p.createVisualShape(p.GEOM_BOX, halfExtents=half, rgbaColor=[0.75, 0.78, 0.82, 1.0])
         print("[WARN] Mesh visual failed to load. Using box visual fallback.")
 
@@ -1238,7 +2278,7 @@ def build_rov():
     p.changeDynamics(rov, -1, linearDamping=0.0, angularDamping=0.0)
     try:
         p.changeDynamics(rov, -1, activationState=p.ACTIVATION_STATE_DISABLE_SLEEPING)
-    except Exception:
+    except pybullet.error:
         pass
 
     print(f"Mesh bounds size (m): {size[0]:.3f} x {size[1]:.3f} x {size[2]:.3f}")
@@ -1394,7 +2434,7 @@ def create_thruster_indicators(rov_id, thrusters):
     # instead of appearing at the world origin for one frame.
     try:
         init_pos, init_quat = p.getBasePositionAndOrientation(rov_id)
-    except Exception:
+    except pybullet.error:
         init_pos, init_quat = (0, 0, 0), (0, 0, 0, 1)
 
     indicators = []
@@ -1493,9 +2533,10 @@ def update_thruster_indicators(indicators, base_pos, base_quat, thr_levels, prox
         p.resetBasePositionAndOrientation(ind["body"], pos_w, quat_w)
 
         # Color change only on state transition
-        if abs_level < 1e-3:
+        # Threshold matches physics zero-flush to prevent stuck indicator colors
+        if abs_level <= 1e-4:
             new_state = 0
-        elif level > 0:
+        elif level > 1e-6:  # Small hysteresis
             new_state = 1
         else:
             new_state = -1
@@ -1517,8 +2558,74 @@ def update_thruster_indicators(indicators, base_pos, base_quat, thr_levels, prox
                 color = THR_IND_COLOR_REV
             try:
                 p.changeVisualShape(ind["body"], -1, rgbaColor=color)
-            except Exception:
+            except pybullet.error:
                 pass
+
+
+def setup_pybullet():
+    """Initialize PyBullet physics server and configure rendering options."""
+    p.connect(p.GUI)
+    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+    p.resetSimulation()
+
+    # Disable expensive rendering features for performance
+    try:
+        p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+        p.configureDebugVisualizer(p.COV_ENABLE_MOUSE_PICKING, 1)
+        p.configureDebugVisualizer(p.COV_ENABLE_RGB_BUFFER_PREVIEW, 0)
+        p.configureDebugVisualizer(p.COV_ENABLE_DEPTH_BUFFER_PREVIEW, 0)
+        p.configureDebugVisualizer(p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW, 0)
+        p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0)
+        p.configureDebugVisualizer(p.COV_ENABLE_WIREFRAME, 0)
+    except pybullet.error:
+        pass
+
+    p.setGravity(0, 0, -GRAVITY)
+    p.setPhysicsEngineParameter(fixedTimeStep=DT, numSolverIterations=50, numSubSteps=1)
+
+
+def teardown_simulation(_rec_active, _rec_writer, _rec_frame_count, _rec_path):
+    """Clean up resources on simulator exit."""
+    global _log_file_handle
+
+    # Finalize any active recording
+    if _rec_active and _rec_writer is not None:
+        try:
+            _rec_writer.release()
+            _dur = _rec_frame_count / max(1, REC_FPS)
+            print(f"[REC] ⏹  Recording saved on exit: {_rec_path}")
+            print(f"[REC]    {_rec_frame_count} frames, ~{_dur:.1f}s duration")
+        except OSError:
+            pass
+
+    if HAS_JOYSTICK and getattr(joystick_panel, "_shared", None) is not None:
+        try:
+            with joystick_panel._shared.get_lock():
+                joystick_panel._shared[REC_STATUS] = REC_STATUS_OK
+                joystick_panel._shared[REC_FLAG] = 0.0
+        except (IndexError, ValueError, OSError):
+            pass
+
+    try:
+        p.disconnect()
+    except pybullet.error:
+        pass
+    if ENABLE_JOYSTICK_PANEL and HAS_JOYSTICK:
+        try:
+            joystick_panel.stop_joystick_panel()
+        except (OSError, RuntimeError):
+            pass
+
+    # Close log file
+    if _log_file_handle is not None:
+        try:
+            _log_file_handle.write("\n" + "=" * 80 + "\n")
+            _log_file_handle.write(f"Simulation ended at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            _log_file_handle.close()
+            print(f"✅ Log saved to: {LOG_FILE}")
+        except OSError:
+            pass
+        _log_file_handle = None
 
 
 def main():
@@ -1526,6 +2633,9 @@ def main():
     global CAM_CHASE_ENABLED, TRAIL_ENABLED, AUTOTEST, AUTOTEST_EXIT
     global LAST_VREL_BODY, LAST_A_BODY, LAST_W_BODY, LAST_ALPHA_BODY
     global OBJ_FILE, GLTF_FILE, ACTIVE_CONFIG_NAME
+    global DEPTH_HOLD_ENABLED, DEPTH_HOLD_TARGET, HEADING_HOLD_ENABLED, HEADING_HOLD_TARGET
+    global PROPORTIONAL_MODE, THRUSTER_FAILURE_ENABLED, THRUSTER_FAILED
+    global SHOW_FORCE_VECTORS, ACTIVE_ENVIRONMENT, NUM_OBSTACLES
     
     # Initialize log file
     try:
@@ -1547,16 +2657,26 @@ def main():
             )
             _log_file_handle.write(hdr)
         print(f"📝 Logging to: {LOG_FILE}")
-    except Exception as e:
+    except OSError as e:
         print(f"⚠️  Could not open log file: {e}")
 
     # ── Thruster configuration selector (before PyBullet GUI opens) ──
     _autotest_mode = os.environ.get("ROV_AUTOTEST", "0") == "1"
     if not _autotest_mode and len(THRUSTER_CONFIGS) > 1:
-        sel = choose_thruster_config()
-        if sel is None:
-            print("[CONFIG] No configuration selected — exiting.")
-            return
+        try:
+            sel = choose_thruster_config()
+            if sel is None:
+                print("[CONFIG] No configuration selected — exiting.")
+                return
+        except (RuntimeError, ImportError) as e:
+            print(f"⚠️  Tkinter selector crashed: {e}")
+            print("[CONFIG] Using auto-fallback to first config.")
+            if THRUSTER_CONFIGS:
+                name = list(THRUSTER_CONFIGS.keys())[0]
+                OBJ_FILE  = THRUSTER_CONFIGS[name]["obj"]
+                GLTF_FILE = THRUSTER_CONFIGS[name]["gltf"]
+                ACTIVE_CONFIG_NAME = name
+                print(f"[CONFIG] Auto-selected: {name}")
     else:
         if THRUSTER_CONFIGS:
             name = list(THRUSTER_CONFIGS.keys())[0]
@@ -1565,166 +2685,10 @@ def main():
             ACTIVE_CONFIG_NAME = name
             print(f"[CONFIG] Auto-selected: {name}")
 
-    p.connect(p.GUI)
-    p.setAdditionalSearchPath(pybullet_data.getDataPath())
-    p.resetSimulation()
+    setup_pybullet()
 
-    # GUI prefs — disable expensive rendering features for performance
-    try:
-        p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)           # hide side panel
-        p.configureDebugVisualizer(p.COV_ENABLE_MOUSE_PICKING, 1)
-        p.configureDebugVisualizer(p.COV_ENABLE_RGB_BUFFER_PREVIEW, 0)
-        p.configureDebugVisualizer(p.COV_ENABLE_DEPTH_BUFFER_PREVIEW, 0)
-        p.configureDebugVisualizer(p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW, 0)
-        p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0)       # shadows are very expensive
-        p.configureDebugVisualizer(p.COV_ENABLE_WIREFRAME, 0)
-    except Exception:
-        pass
-
-    p.setGravity(0, 0, -GRAVITY)
-    p.setPhysicsEngineParameter(fixedTimeStep=DT, numSolverIterations=50, numSubSteps=1)
-
-    # Seabed collision plane at pool bottom
-    p.loadURDF("plane.urdf", [0, 0, SEABED_Z])
-
-    # Water surface visual indicator (translucent plane)
-    try:
-        surface_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[5, 5, 0.002],
-                                           rgbaColor=[0.3, 0.6, 0.8, 0.1])
-        p.createMultiBody(baseMass=0, baseVisualShapeIndex=surface_vis,
-                          basePosition=[0, 0, SURFACE_Z])
-    except Exception:
-        pass
-
-    # ============================================
-    # ENVIRONMENT DETAIL — pool/test-tank setting with riser structures
-    # ============================================
-    _env_ids = []
-
-    # --- Pool walls (translucent blue-green) ---
-    POOL_HALF_X = 3.0   # pool length ±3m
-    POOL_HALF_Y = 2.0   # pool width ±2m
-    POOL_DEPTH  = SURFACE_Z - SEABED_Z  # total water depth
-    WALL_THICK  = 0.02
-    WALL_COLOR  = [0.55, 0.75, 0.85, 0.15]  # light blue, very translucent
-    WALL_COLOR_FLOOR = [0.3, 0.28, 0.22, 0.7]  # sandy/concrete pool floor
-    try:
-        # Pool floor (textured seabed)
-        floor_vis = p.createVisualShape(p.GEOM_BOX,
-            halfExtents=[POOL_HALF_X, POOL_HALF_Y, 0.02],
-            rgbaColor=WALL_COLOR_FLOOR)
-        _env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=floor_vis,
-            basePosition=[0, 0, SEABED_Z + 0.02]))
-
-        # Pool floor grid lines (visual depth reference)
-        for gx in range(-3, 4):
-            _env_ids.append(p.addUserDebugLine(
-                [gx, -POOL_HALF_Y, SEABED_Z + 0.03],
-                [gx,  POOL_HALF_Y, SEABED_Z + 0.03],
-                [0.4, 0.38, 0.32], 1, lifeTime=0))
-        for gy in range(-2, 3):
-            _env_ids.append(p.addUserDebugLine(
-                [-POOL_HALF_X, gy, SEABED_Z + 0.03],
-                [ POOL_HALF_X, gy, SEABED_Z + 0.03],
-                [0.4, 0.38, 0.32], 1, lifeTime=0))
-
-        # Four walls
-        # Front wall (+X)
-        wall_vis = p.createVisualShape(p.GEOM_BOX,
-            halfExtents=[WALL_THICK, POOL_HALF_Y, POOL_DEPTH/2],
-            rgbaColor=WALL_COLOR)
-        _env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=wall_vis,
-            basePosition=[POOL_HALF_X, 0, SEABED_Z + POOL_DEPTH/2]))
-        # Back wall (-X)
-        _env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=wall_vis,
-            basePosition=[-POOL_HALF_X, 0, SEABED_Z + POOL_DEPTH/2]))
-        # Left wall (+Y)
-        wall_vis_side = p.createVisualShape(p.GEOM_BOX,
-            halfExtents=[POOL_HALF_X, WALL_THICK, POOL_DEPTH/2],
-            rgbaColor=WALL_COLOR)
-        _env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=wall_vis_side,
-            basePosition=[0, POOL_HALF_Y, SEABED_Z + POOL_DEPTH/2]))
-        # Right wall (-Y)
-        _env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=wall_vis_side,
-            basePosition=[0, -POOL_HALF_Y, SEABED_Z + POOL_DEPTH/2]))
-
-        # --- Riser pipes (vertical cylinders to simulate offshore wind turbine risers) ---
-        RISER_RADIUS = 0.08
-        RISER_HEIGHT = POOL_DEPTH + 0.3  # extend slightly above waterline
-        RISER_COLOR = [0.45, 0.42, 0.40, 0.9]  # weathered steel gray
-        RISER_STRIPE = [0.9, 0.6, 0.1, 0.85]   # yellow inspection stripe
-
-        riser_positions = [
-            (1.5,  0.5, SEABED_Z + RISER_HEIGHT/2),
-            (1.5, -0.5, SEABED_Z + RISER_HEIGHT/2),
-            (2.0,  0.0, SEABED_Z + RISER_HEIGHT/2),
-        ]
-        for rx, ry, rz in riser_positions:
-            # Main riser cylinder (collision + visual)
-            riser_col = p.createCollisionShape(p.GEOM_CYLINDER, radius=RISER_RADIUS, height=RISER_HEIGHT)
-            riser_vis = p.createVisualShape(p.GEOM_CYLINDER, radius=RISER_RADIUS, length=RISER_HEIGHT,
-                                             rgbaColor=RISER_COLOR)
-            rid = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=riser_col,
-                                     baseVisualShapeIndex=riser_vis,
-                                     basePosition=[rx, ry, rz])
-            _env_ids.append(rid)
-
-            # Yellow inspection stripe ring around each riser at mid-depth
-            stripe_vis = p.createVisualShape(p.GEOM_CYLINDER,
-                radius=RISER_RADIUS + 0.005, length=0.05,
-                rgbaColor=RISER_STRIPE)
-            _env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=stripe_vis,
-                basePosition=[rx, ry, 0.0]))  # stripe at z=0 (inspection depth)
-
-            # Base flange
-            flange_vis = p.createVisualShape(p.GEOM_CYLINDER,
-                radius=RISER_RADIUS * 1.5, length=0.04,
-                rgbaColor=[0.35, 0.33, 0.30, 0.9])
-            _env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=flange_vis,
-                basePosition=[rx, ry, SEABED_Z + 0.04]))
-
-        # --- Cross-brace between two risers (horizontal pipe) ---
-        brace_len = math.sqrt((1.5-1.5)**2 + (0.5-(-0.5))**2)  # distance between riser pair
-        brace_vis = p.createVisualShape(p.GEOM_CYLINDER,
-            radius=0.025, length=brace_len,
-            rgbaColor=[0.5, 0.48, 0.44, 0.8])
-        brace_quat = p.getQuaternionFromEuler([math.pi/2, 0, 0])  # rotate to horizontal Y-axis
-        _env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=brace_vis,
-            basePosition=[1.5, 0.0, -0.3],
-            baseOrientation=brace_quat))
-
-        # Diagonal cross-brace
-        dx_b = 2.0 - 1.5
-        dy_b = 0.0 - 0.5
-        brace_len2 = math.sqrt(dx_b**2 + dy_b**2)
-        angle_b = math.atan2(dy_b, dx_b)
-        brace_vis2 = p.createVisualShape(p.GEOM_CYLINDER,
-            radius=0.02, length=brace_len2,
-            rgbaColor=[0.5, 0.48, 0.44, 0.7])
-        brace_quat2 = p.getQuaternionFromEuler([math.pi/2, 0, angle_b])
-        _env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=brace_vis2,
-            basePosition=[1.75, 0.25, -0.6],
-            baseOrientation=brace_quat2))
-
-        # --- Scattered debris / marine growth on seabed --- (disabled)
-
-        # --- Depth markers on pool wall (measurement reference) ---
-        for depth_m in range(0, int(POOL_DEPTH) + 1):
-            z_mark = SURFACE_Z - depth_m
-            if z_mark < SEABED_Z:
-                break
-            # Small colored rectangle on the +Y wall
-            mark_vis = p.createVisualShape(p.GEOM_BOX,
-                halfExtents=[0.08, 0.002, 0.01],
-                rgbaColor=[1.0, 1.0, 0.2, 0.9] if depth_m % 2 == 0 else [1.0, 0.3, 0.1, 0.9])
-            _env_ids.append(p.createMultiBody(baseMass=0, baseVisualShapeIndex=mark_vis,
-                basePosition=[0, POOL_HALF_Y - 0.01, z_mark]))
-
-        print(f"[ENV] Pool environment created: {POOL_HALF_X*2:.0f}m × {POOL_HALF_Y*2:.0f}m × {POOL_DEPTH:.1f}m deep")
-        print(f"[ENV] {len(riser_positions)} riser pipes with inspection stripes")
-        print(f"[ENV] Grid lines, depth markers added")
-    except Exception as env_err:
-        print(f"[ENV] Warning: environment setup error: {env_err}")
+    # ── Build environment from preset ──
+    _env_ids = create_environment(ACTIVE_ENVIRONMENT)
 
     rov, mesh_center = build_rov()
 
@@ -1885,42 +2849,46 @@ def main():
     TRAIL_COLOR_RECENT = [0.0, 0.9, 1.0] # cyan
     TRAIL_COLOR_OLD    = [0.0, 0.2, 0.3] # dark teal
 
+    # ── Timing metrics state ─────────────────────────────────────
+    _timing_frame_count = 0
+    _timing_physics_total = 0.0
+    _timing_render_total = 0.0
+    _timing_last_report = time.monotonic()
+    _timing_fps_samples = []
+
+    # ── Assist mode state ────────────────────────────────────────
+    DEPTH_HOLD_ENABLED = False
+    DEPTH_HOLD_TARGET = None
+    HEADING_HOLD_ENABLED = False
+    HEADING_HOLD_TARGET = None
+    _depth_hold_force = 0.0
+    _heading_hold_torque = 0.0
+
+    # ── Thruster failure simulation state ────────────────────────
+    THRUSTER_FAILED = [False] * len(THRUSTERS) if THRUSTER_FAILURE_ENABLED else []
+    _thruster_fail_timer = [0.0] * len(THRUSTERS)
+
+    # ── Debug force visualization state ──────────────────────────
+    _force_viz_ids = {}  # maps label → debug line ID
+
     print("\n" + "🌊 "*20)
     print("╔" + "═"*68 + "╗")
     print("║" + " CTRL+SEA ROV SIMULATOR — PyBullet Physics Engine ".center(68) + "║")
     print("╚" + "═"*68 + "╝")
     
     print("\n" + "─"*72)
-    print("📋 COMPLETE KEYBOARD CONTROLS")
+    print("📋 RUNTIME CONTROLS (TKINTER SETTINGS PANEL)")
     print("─"*72)
-    print("\n🔧 THRUSTER CONTROL:")
-    print("  [1-4]        Toggle Thruster 1-4 ON (forward) / OFF")
-    print("  [5-8]        Toggle Thruster 1-4 ON (reverse) / OFF")
-    print("  [Z/X/C/V]   Toggle Reverse mode for Thrusters 1-4")
-    print("  [+]/[-]      Increase/decrease thrust power level")
-    print("               Thruster 1-3: Horizontal | Thruster 4: Vertical (Heave)")
-    
-    print("\n📷 CAMERA CONTROL:")
-    print("  [J]/[L]      Yaw camera left/right")
-    print("  [I]/[K]      Pitch camera up/down")
-    print("  [U]/[O]      Zoom camera in/out")
-    print("  [N]/[M]      Pan camera target up/down")
-    print("  [F]          Toggle camera follow mode (ON/OFF)")
-    
-    print("\n🚧 OBSTACLE MANIPULATION:")
-    print("  [TAB]        Select next obstacle (cycles through all)")
-    print("  [W]/[A]/[S]/[D]  Move selected obstacle forward/left/back/right")
-    print("  [Q]/[E]      Move selected obstacle up/down (depth)")
-    print("  [X]          Reset selected obstacle to random position")
-    print("  [Mouse]      Click-drag obstacles with left mouse button")
-    
-    print("\n⏮️  SIMULATION CONTROL:")
-    print("  [R]          Reset ROV to start position (faces obstacles)")
-    print("  [F]          Toggle camera follow mode (ON/OFF)")
-    print("  [G]          Toggle chase camera (auto-orbit behind ROV heading)")
-    print("  [T]          Toggle top-down view (bird's-eye looking straight down)")
-    print("  [0]          Emergency surface (full heave up, kill horizontals)")
-    print("  [ESC]        Quit simulator")
+    print("\n🎛️ SETTINGS PANEL:")
+    print("  Open from controller: SETTINGS button")
+    print("  Propulsion: thrust level, proportional mode, emergency surface")
+    print("  Assist: depth hold, heading hold")
+    print("  Camera: follow, chase, top-down")
+    print("  Diagnostics: force vectors, thruster failure, trail")
+    print("  Actions: reset ROV")
+    print("\n🎮 DIRECT CONTROL:")
+    print("  Controller panel sticks + heave buttons drive thrusters")
+    print("  Keyboard setting controls in simulator are disabled")
 
     if ENABLE_JOYSTICK_PANEL and HAS_JOYSTICK:
         print("\n🎮 CONTROLLER PANEL (separate window):")
@@ -1971,12 +2939,18 @@ def main():
         feat_list.append("Collision detection feedback")
     if TRAIL_ENABLED:
         feat_list.append("Breadcrumb trail (path history)")
-    feat_list.append(f"Emergency surface [0] key")
-    feat_list.append(f"Chase camera [G] key")
-    feat_list.append(f"Top-down view [T] key")
+    feat_list.append("Emergency surface via settings panel")
+    feat_list.append("Chase camera via settings panel")
+    feat_list.append("Top-down view via settings panel")
     feat_list.append("Dynamic thruster indicators (length scales with ramp)")
     feat_list.append("Thruster efficiency readout in telemetry")
     feat_list.append("⏺ Screen recording (REC button on controller panel)")
+    feat_list.append("🤖 Depth hold + heading hold from settings panel")
+    feat_list.append("🎮 Proportional joystick mode from settings panel")
+    feat_list.append("📊 Force vector visualization from settings panel")
+    feat_list.append("💥 Thruster failure simulation from settings panel")
+    feat_list.append(f"🌊 Environment presets: {', '.join(ENVIRONMENT_PRESETS.keys())}")
+    feat_list.append(f"⏱ FPS / timing metrics")
     for fi, feat in enumerate(feat_list):
         print(f"  {'├' if fi < len(feat_list)-1 else '└'}─ {feat}")
     
@@ -1997,9 +2971,22 @@ def main():
     # ── Top-down view state ───────────────────────────────────────
     _topdown_active = False
     _topdown_saved = (cam_dist, cam_pitch, cam_yaw)  # saved camera state for restore
+    _panel_last_reset_cmd = 0
+    _panel_last_depth_hold = DEPTH_HOLD_ENABLED
+    _panel_last_heading_hold = HEADING_HOLD_ENABLED
+    _panel_last_prop_mode = PROPORTIONAL_MODE
+    _panel_last_cam_follow = cam_follow
+    _panel_last_cam_chase = CAM_CHASE_ENABLED
+    _panel_last_topdown = _topdown_active
+    _panel_last_force_viz = SHOW_FORCE_VECTORS
+    _panel_last_thr_fail = THRUSTER_FAILURE_ENABLED
+    _panel_last_emergency = _emergency_surface_active
+    _panel_last_trail = TRAIL_ENABLED
 
     while p.isConnected():
-        keys = p.getKeyboardEvents()
+        # Keyboard setting controls are intentionally disabled.
+        # Runtime settings are driven from the Tkinter settings panel.
+        keys = {}
 
         # Exit
         if 27 in keys and keys[27] & p.KEY_WAS_TRIGGERED:
@@ -2022,7 +3009,7 @@ def main():
             for _tid in _trail_line_ids:
                 try:
                     p.removeUserDebugItem(_tid)
-                except Exception:
+                except pybullet.error:
                     pass
             _trail_positions.clear()
             _trail_line_ids.clear()
@@ -2055,6 +3042,61 @@ def main():
                 print("[CAM] Top-down view: OFF (camera restored)")
             p.resetDebugVisualizerCamera(cameraDistance=cam_dist, cameraYaw=cam_yaw,
                                          cameraPitch=cam_pitch, cameraTargetPosition=cam_target)
+
+        # ── Depth hold toggle (H key) ─────────────────────────────
+        if ord('h') in keys and keys[ord('h')] & p.KEY_WAS_TRIGGERED:
+            DEPTH_HOLD_ENABLED = not DEPTH_HOLD_ENABLED
+            if DEPTH_HOLD_ENABLED:
+                current_depth = max(0.0, SURFACE_Z - base_pos[2])
+                DEPTH_HOLD_TARGET = current_depth
+                print(f"[ASSIST] Depth hold: ON — holding {current_depth:.2f}m")
+            else:
+                DEPTH_HOLD_TARGET = None
+                print("[ASSIST] Depth hold: OFF")
+
+        # ── Heading hold toggle (Y key) ───────────────────────────
+        if ord('y') in keys and keys[ord('y')] & p.KEY_WAS_TRIGGERED:
+            HEADING_HOLD_ENABLED = not HEADING_HOLD_ENABLED
+            if HEADING_HOLD_ENABLED:
+                _, _, yaw_hold = p.getEulerFromQuaternion(base_quat)
+                HEADING_HOLD_TARGET = yaw_hold
+                print(f"[ASSIST] Heading hold: ON — holding {math.degrees(yaw_hold):.1f} deg")
+            else:
+                HEADING_HOLD_TARGET = None
+                print("[ASSIST] Heading hold: OFF")
+
+        # ── Proportional mode toggle (P key) ──────────────────────
+        if ord('p') in keys and keys[ord('p')] & p.KEY_WAS_TRIGGERED:
+            PROPORTIONAL_MODE = not PROPORTIONAL_MODE
+            print(f"[CTRL] Proportional joystick: {'ON' if PROPORTIONAL_MODE else 'OFF (binary)'}")
+
+        # ── Force vector debug visualization toggle (B key) ───────
+        if ord('b') in keys and keys[ord('b')] & p.KEY_WAS_TRIGGERED:
+            SHOW_FORCE_VECTORS = not SHOW_FORCE_VECTORS
+            if not SHOW_FORCE_VECTORS:
+                # Remove existing debug lines
+                for _fvid in _force_viz_ids.values():
+                    try:
+                        p.removeUserDebugItem(_fvid)
+                    except pybullet.error:
+                        pass
+                _force_viz_ids.clear()
+            print(f"[VIZ] Force vectors: {'ON' if SHOW_FORCE_VECTORS else 'OFF'}")
+
+        # ── Thruster failure toggle (\ key) ───────────────────────
+        if ord('\\') in keys and keys[ord('\\')] & p.KEY_WAS_TRIGGERED:
+            THRUSTER_FAILURE_ENABLED = not THRUSTER_FAILURE_ENABLED
+            if THRUSTER_FAILURE_ENABLED:
+                THRUSTER_FAILED = [False] * len(THRUSTERS)
+                _thruster_fail_timer = [0.0] * len(THRUSTERS)
+                # Fail a random thruster immediately for testing
+                import random as _rnd
+                fail_idx = _rnd.randint(0, len(THRUSTERS) - 1)
+                THRUSTER_FAILED[fail_idx] = True
+                print(f"[FAIL] Thruster failure mode: ON — T{fail_idx + 1} FAILED")
+            else:
+                THRUSTER_FAILED = [False] * len(THRUSTERS)
+                print("[FAIL] Thruster failure mode: OFF — all thrusters restored")
 
         # Emergency surface (key '0') — full heave up, kill horizontals
         if EMERGENCY_SURFACE_KEY in keys and keys[EMERGENCY_SURFACE_KEY] & p.KEY_WAS_TRIGGERED:
@@ -2115,7 +3157,7 @@ def main():
                 if obs_moved:
                     p.resetBasePositionAndOrientation(sel_oid, o_pos, o_quat)
                     p.resetBaseVelocity(sel_oid, [0, 0, 0], [0, 0, 0])
-            except Exception:
+            except pybullet.error:
                 pass
 
         # Camera controls
@@ -2224,7 +3266,11 @@ def main():
         if ENABLE_JOYSTICK_PANEL and HAS_JOYSTICK:
             js = joystick_panel.get_joystick_state()
             if js.get("active", False):
-                js_cmds = joystick_panel.mix_joystick_to_thruster_cmds(js, len(THRUSTERS))
+                js_cmds = joystick_panel.mix_joystick_to_thruster_cmds(
+                    js, len(THRUSTERS),
+                    proportional=PROPORTIONAL_MODE,
+                    input_exponent=INPUT_CURVE_EXPONENT,
+                    input_deadzone=INPUT_DEADZONE)
                 _now = time.monotonic()
                 for i in range(len(THRUSTERS)):
                     desired = js_cmds[i]   # -1, 0, or +1
@@ -2285,13 +3331,177 @@ def main():
         try:
             base_pos, base_quat = p.getBasePositionAndOrientation(rov)
             lin, ang = p.getBaseVelocity(rov)
-        except Exception:
+        except pybullet.error:
             if not p.isConnected():
                 print("\n[ERROR] PyBullet connection lost (possible physics server crash).")
                 break
             print("\n[ERROR] Physics solver instability detected (getBaseVelocity failed).")
             print("[HINT] Try: lowering MAX_THRUST_H/MAX_THRUST_V, increasing LIN_DRAG_ANG, or reducing MAX_OMEGA.\n")
             break
+
+        # ---- PANEL-DRIVEN RUNTIME SETTINGS ----
+        if ENABLE_JOYSTICK_PANEL and HAS_JOYSTICK and getattr(joystick_panel, "_shared", None) is not None:
+            try:
+                with joystick_panel._shared.get_lock():
+                    _set_thrust = joystick_panel._shared[SET_THRUST_LEVEL]
+                    _set_prop = joystick_panel._shared[SET_PROPORTIONAL_MODE] > 0.5
+                    _set_depth_hold = joystick_panel._shared[SET_DEPTH_HOLD] > 0.5
+                    _set_heading_hold = joystick_panel._shared[SET_HEADING_HOLD] > 0.5
+                    _set_cam_follow = joystick_panel._shared[SET_CAM_FOLLOW] > 0.5
+                    _set_cam_chase = joystick_panel._shared[SET_CAM_CHASE] > 0.5
+                    _set_topdown = joystick_panel._shared[SET_TOPDOWN] > 0.5
+                    _set_force_viz = joystick_panel._shared[SET_SHOW_FORCE_VECTORS] > 0.5
+                    _set_thr_fail = joystick_panel._shared[SET_THRUSTER_FAILURE] > 0.5
+                    _set_emergency = joystick_panel._shared[SET_EMERGENCY_SURFACE] > 0.5
+                    _set_reset_cmd = int(round(joystick_panel._shared[CMD_RESET_ROV]))
+                    _set_trail = joystick_panel._shared[SET_TRAIL_ENABLED] > 0.5
+            except (IndexError, ValueError, OSError):
+                _set_thrust = THRUST_LEVEL
+                _set_prop = PROPORTIONAL_MODE
+                _set_depth_hold = DEPTH_HOLD_ENABLED
+                _set_heading_hold = HEADING_HOLD_ENABLED
+                _set_cam_follow = cam_follow
+                _set_cam_chase = CAM_CHASE_ENABLED
+                _set_topdown = _topdown_active
+                _set_force_viz = SHOW_FORCE_VECTORS
+                _set_thr_fail = THRUSTER_FAILURE_ENABLED
+                _set_emergency = _emergency_surface_active
+                _set_reset_cmd = _panel_last_reset_cmd
+                _set_trail = TRAIL_ENABLED
+
+            THRUST_LEVEL = clamp(float(_set_thrust), 0.1, 1.0)
+
+            if _set_prop != _panel_last_prop_mode:
+                PROPORTIONAL_MODE = _set_prop
+                _panel_last_prop_mode = _set_prop
+                print(f"[CTRL] Proportional joystick: {'ON' if PROPORTIONAL_MODE else 'OFF (binary)'}")
+
+            if _set_depth_hold != _panel_last_depth_hold:
+                DEPTH_HOLD_ENABLED = _set_depth_hold
+                _panel_last_depth_hold = _set_depth_hold
+                if DEPTH_HOLD_ENABLED:
+                    current_depth = max(0.0, SURFACE_Z - base_pos[2])
+                    DEPTH_HOLD_TARGET = current_depth
+                    print(f"[ASSIST] Depth hold: ON — holding {current_depth:.2f}m")
+                else:
+                    DEPTH_HOLD_TARGET = None
+                    print("[ASSIST] Depth hold: OFF")
+
+            if _set_heading_hold != _panel_last_heading_hold:
+                HEADING_HOLD_ENABLED = _set_heading_hold
+                _panel_last_heading_hold = _set_heading_hold
+                if HEADING_HOLD_ENABLED:
+                    _, _, yaw_hold = p.getEulerFromQuaternion(base_quat)
+                    HEADING_HOLD_TARGET = yaw_hold
+                    print(f"[ASSIST] Heading hold: ON — holding {math.degrees(yaw_hold):.1f} deg")
+                else:
+                    HEADING_HOLD_TARGET = None
+                    print("[ASSIST] Heading hold: OFF")
+
+            if _set_cam_follow != _panel_last_cam_follow:
+                cam_follow = _set_cam_follow
+                _panel_last_cam_follow = _set_cam_follow
+                print(f"[CAM] Follow mode: {'ON' if cam_follow else 'OFF'}")
+
+            if _set_cam_chase != _panel_last_cam_chase:
+                CAM_CHASE_ENABLED = _set_cam_chase
+                _panel_last_cam_chase = _set_cam_chase
+                print(f"[CAM] Chase camera: {'ON' if CAM_CHASE_ENABLED else 'OFF'}")
+
+            if _set_topdown != _panel_last_topdown:
+                _panel_last_topdown = _set_topdown
+                _topdown_active = _set_topdown
+                if _topdown_active:
+                    _topdown_saved = (cam_dist, cam_pitch, cam_yaw)
+                    cam_pitch = -89.9
+                    cam_dist = 3.5
+                    print("[CAM] Top-down view: ON")
+                else:
+                    cam_dist, cam_pitch, cam_yaw = _topdown_saved
+                    print("[CAM] Top-down view: OFF")
+                p.resetDebugVisualizerCamera(cameraDistance=cam_dist, cameraYaw=cam_yaw,
+                                             cameraPitch=cam_pitch, cameraTargetPosition=cam_target)
+
+            if _set_force_viz != _panel_last_force_viz:
+                SHOW_FORCE_VECTORS = _set_force_viz
+                _panel_last_force_viz = _set_force_viz
+                if not SHOW_FORCE_VECTORS:
+                    for _fvid in _force_viz_ids.values():
+                        try:
+                            p.removeUserDebugItem(_fvid)
+                        except pybullet.error:
+                            pass
+                    _force_viz_ids.clear()
+                print(f"[VIZ] Force vectors: {'ON' if SHOW_FORCE_VECTORS else 'OFF'}")
+
+            if _set_thr_fail != _panel_last_thr_fail:
+                THRUSTER_FAILURE_ENABLED = _set_thr_fail
+                _panel_last_thr_fail = _set_thr_fail
+                if THRUSTER_FAILURE_ENABLED:
+                    THRUSTER_FAILED = [False] * len(THRUSTERS)
+                    _thruster_fail_timer = [0.0] * len(THRUSTERS)
+                    fail_idx = random.randint(0, len(THRUSTERS) - 1)
+                    THRUSTER_FAILED[fail_idx] = True
+                    print(f"[FAIL] Thruster failure mode: ON — T{fail_idx + 1} FAILED")
+                else:
+                    THRUSTER_FAILED = [False] * len(THRUSTERS)
+                    print("[FAIL] Thruster failure mode: OFF — all thrusters restored")
+
+            if _set_emergency != _panel_last_emergency:
+                _panel_last_emergency = _set_emergency
+                _emergency_surface_active = _set_emergency
+                if _emergency_surface_active:
+                    print("[⚠️  EMERGENCY SURFACE] Engaging full heave — killing horizontal thrusters")
+                    for i in range(len(THRUSTERS)):
+                        if THRUSTERS[i]["kind"] == "H":
+                            thr_cmd[i] = 0.0
+                            thr_on[i] = False
+                            thr_reverse[i] = False
+                        elif THRUSTERS[i]["kind"] == "V":
+                            thr_cmd[i] = 1.0
+                            thr_on[i] = True
+                            thr_reverse[i] = False
+                else:
+                    print("[✅ EMERGENCY SURFACE] Disengaged — manual control restored")
+                    for i in range(len(THRUSTERS)):
+                        if THRUSTERS[i]["kind"] == "V":
+                            thr_cmd[i] = 0.0
+                            thr_on[i] = False
+                            thr_reverse[i] = False
+
+            if _set_trail != _panel_last_trail:
+                TRAIL_ENABLED = _set_trail
+                _panel_last_trail = _set_trail
+                if not TRAIL_ENABLED:
+                    for _tid in _trail_line_ids:
+                        try:
+                            p.removeUserDebugItem(_tid)
+                        except pybullet.error:
+                            pass
+                    _trail_positions.clear()
+                    _trail_line_ids.clear()
+                    _trail_last_pos = None
+                print(f"[VIZ] Trail: {'ON' if TRAIL_ENABLED else 'OFF'}")
+
+            if _set_reset_cmd > _panel_last_reset_cmd:
+                _panel_last_reset_cmd = _set_reset_cmd
+                start_pos = [0, 0, 0.60]
+                start_rpy = [0, 0, 0]
+                p.resetBasePositionAndOrientation(rov, start_pos, p.getQuaternionFromEuler(start_rpy))
+                p.resetBaseVelocity(rov, [0, 0, 0], [0, 0, 0])
+                LAST_VREL_BODY = None
+                LAST_A_BODY = (0.0, 0.0, 0.0)
+                LAST_W_BODY = None
+                LAST_ALPHA_BODY = (0.0, 0.0, 0.0)
+                for _tid in _trail_line_ids:
+                    try:
+                        p.removeUserDebugItem(_tid)
+                    except pybullet.error:
+                        pass
+                _trail_positions.clear()
+                _trail_line_ids.clear()
+                _trail_last_pos = None
+                print(f"[SIM] Reset ROV to {start_pos} facing forward (yaw={start_rpy[2]:.0f}°)")
 
         # Auto-follow: keep camera tracking the ROV (every frame for smooth visuals)
         if cam_follow:
@@ -2362,7 +3572,7 @@ def main():
                             list(_trail_last_pos), list(base_pos),
                             color, lineWidth=1.5, lifeTime=0)
                         _trail_line_ids.append(lid)
-                    except Exception:
+                    except pybullet.error:
                         pass
                     _trail_positions.append(base_pos)
                     _trail_last_pos = base_pos
@@ -2370,7 +3580,7 @@ def main():
                     if len(_trail_positions) > TRAIL_MAX_POINTS:
                         try:
                             p.removeUserDebugItem(_trail_line_ids[0])
-                        except Exception:
+                        except pybullet.error:
                             pass
                         _trail_positions.pop(0)
                         _trail_line_ids.pop(0)
@@ -2384,7 +3594,7 @@ def main():
             if ENABLE_JOYSTICK_PANEL and HAS_JOYSTICK:
                 try:
                     _cam_tilt_norm = joystick_panel.get_joystick_state().get("cam_tilt", 0.0)
-                except Exception:
+                except (IndexError, ValueError, OSError):
                     pass
             tilt_rad = _cam_tilt_norm * deg2rad(CAMERA_SERVO_MAX_DEG)
 
@@ -2499,7 +3709,7 @@ def main():
                             flat = bytes(rgba)
                             rgb_bytes = bytes(flat[i] for i in range(len(flat)) if i % 4 != 3)
                         joystick_panel.push_camera_frame(rgb_bytes)
-                    except Exception:
+                    except (ValueError, OSError):
                         pass
                 # Also show in OpenCV window if available (fallback)
                 elif rgba_tinted is not None and cv2 is not None:
@@ -2517,12 +3727,12 @@ def main():
         if HAS_JOYSTICK and ENABLE_JOYSTICK_PANEL:
             try:
                 _rec_want = joystick_panel.is_recording()
-            except Exception:
+            except (IndexError, ValueError, OSError):
                 pass
 
-        # Panel dimensions for recording (imported from joystick_panel)
-        _PANEL_W = 720
-        _PANEL_H = 480
+        # Panel dimensions for recording (shared with joystick_panel)
+        _PANEL_W = CTRL_W
+        _PANEL_H = CTRL_H
 
         if _rec_want and not _rec_active:
             # --- START recording ---
@@ -2530,10 +3740,17 @@ def main():
                 print("[REC] ⚠️  Recording requires opencv-python and numpy. Install with:")
                 print("      pip install opencv-python numpy")
                 try:
-                    joystick_panel._shared[8] = 0.0
-                except Exception:
+                    with joystick_panel._shared.get_lock():
+                        joystick_panel._shared[REC_FLAG] = 0.0
+                        joystick_panel._shared[REC_STATUS] = REC_STATUS_MISSING_DEPS
+                except (IndexError, ValueError, OSError):
                     pass
             else:
+                try:
+                    with joystick_panel._shared.get_lock():
+                        joystick_panel._shared[REC_STATUS] = REC_STATUS_OK
+                except (IndexError, ValueError, OSError):
+                    pass
                 _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 _rec_path = os.path.join(REC_SAVE_DIR, f"rov_recording_{_ts}.mp4")
                 # Output: 3D view (left) + full controller panel (right)
@@ -2553,8 +3770,10 @@ def main():
                     print(f"[REC] ⚠️  Failed to open video writer for {_rec_path}")
                     _rec_writer = None
                     try:
-                        joystick_panel._shared[8] = 0.0
-                    except Exception:
+                        with joystick_panel._shared.get_lock():
+                            joystick_panel._shared[REC_FLAG] = 0.0
+                            joystick_panel._shared[REC_STATUS] = REC_STATUS_WRITER_OPEN_FAILED
+                    except (IndexError, ValueError, OSError):
                         pass
 
         elif _rec_active and not _rec_want:
@@ -2565,6 +3784,11 @@ def main():
                 print(f"[REC] ⏹  Recording saved: {_rec_path}")
                 print(f"[REC]    {_rec_frame_count} frames, ~{_dur:.1f}s duration")
                 _rec_writer = None
+            try:
+                with joystick_panel._shared.get_lock():
+                    joystick_panel._shared[REC_STATUS] = REC_STATUS_OK
+            except (AttributeError, IndexError, ValueError, OSError):
+                pass
             _rec_active = False
             _rec_path = None
 
@@ -2605,7 +3829,7 @@ def main():
                         _panel_frame = np.frombuffer(_p_raw, dtype=np.uint8).reshape(
                             _PANEL_H, _PANEL_W, 3)
                         _rec_panel_seq = _p_seq
-                except Exception:
+                except (ValueError, OSError):
                     pass
                 if _panel_frame is None:
                     _panel_frame = np.zeros((_PANEL_H, _PANEL_W, 3), dtype=np.uint8)
@@ -2630,10 +3854,15 @@ def main():
                 _bgr = _composite[:, :, ::-1]
                 _rec_writer.write(_bgr)
                 _rec_frame_count += 1
-            except Exception as _rec_err:
+            except (ValueError, OSError, cv2.error) as _rec_err:
                 # Don't crash the sim if recording fails
                 if _rec_frame_count == 0:
                     print(f"[REC] ⚠️  Frame capture error: {_rec_err}")
+                try:
+                    with joystick_panel._shared.get_lock():
+                        joystick_panel._shared[REC_STATUS] = REC_STATUS_FRAME_WRITE_FAILED
+                except (AttributeError, IndexError, ValueError, OSError):
+                    pass
 
         # If autotest is enabled, perform scheduled simulated actions (no GUI keys needed)
         if AUTOTEST and (sim_step in autotest_schedule):
@@ -2735,14 +3964,14 @@ def main():
         if _need_vis and ENABLE_MARKERS:
             try:
                 p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0)
-            except Exception:
+            except pybullet.error:
                 pass
             for i, t in enumerate(THRUSTERS):
                 if i < len(markers):
                     update_marker_pose(markers[i], base_pos, base_quat, t)
             try:
                 p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1)
-            except Exception:
+            except pybullet.error:
                 pass
 
         # ---- UPDATE TIME-VARYING OCEAN CURRENT ----
@@ -2784,14 +4013,29 @@ def main():
             apply_righting_torque(rov, base_quat, ang, submersion)
         F_drag, T_drag, sat_drag = apply_drag(rov, base_pos, base_quat, lin, ang)
 
-        # Push attitude (roll/pitch) to joystick panel for attitude indicator
+        # ── Assist mode forces ──────────────────────────────────
+        _depth_hold_force = apply_depth_hold(rov, base_pos, lin)
+        _heading_hold_torque = apply_heading_hold(rov, base_quat, ang)
+
+        # Push attitude + telemetry to joystick panel
         if ENABLE_JOYSTICK_PANEL and HAS_JOYSTICK and (sim_step % prev_every) == 0:
             try:
                 _att_roll, _att_pitch, _ = p.getEulerFromQuaternion(base_quat)
+                _, _, _yaw_telem = p.getEulerFromQuaternion(base_quat)
+                _spd_telem = math.sqrt(lin[0]**2 + lin[1]**2 + lin[2]**2)
                 with joystick_panel._shared.get_lock():
-                    joystick_panel._shared[6] = _att_roll
-                    joystick_panel._shared[7] = _att_pitch
-            except Exception:
+                    joystick_panel._shared[ROLL_RAD] = _att_roll
+                    joystick_panel._shared[PITCH_RAD] = _att_pitch
+                    joystick_panel._shared[DEPTH_M] = depth
+                    joystick_panel._shared[HEADING_DEG] = math.degrees(_yaw_telem) % 360.0
+                    joystick_panel._shared[SPEED_MPS] = _spd_telem
+                    joystick_panel._shared[SHM_THRUST_LEVEL] = THRUST_LEVEL
+                    joystick_panel._shared[DEPTH_HOLD_ACTIVE] = 1.0 if DEPTH_HOLD_ENABLED else 0.0
+                    joystick_panel._shared[HEADING_HOLD_ACTIVE] = 1.0 if HEADING_HOLD_ENABLED else 0.0
+                    joystick_panel._shared[CONTROL_MODE] = (
+                        CONTROL_MODE_PROPORTIONAL if PROPORTIONAL_MODE else CONTROL_MODE_BINARY
+                    )
+            except (IndexError, ValueError, OSError):
                 pass
 
         # Compute force/torque budget terms for logging — only when needed
@@ -2825,6 +4069,12 @@ def main():
         T_thr_total = (0.0, 0.0, 0.0)
 
         for i, t in enumerate(THRUSTERS):
+            # ── Thruster failure: skip force application if this thruster is failed ──
+            if THRUSTER_FAILURE_ENABLED and i < len(THRUSTER_FAILED) and THRUSTER_FAILED[i]:
+                thr_level[i] = 0.0
+                _thr_efficiency[i] = 0.0
+                continue
+
             # First-order ramp to command with asymmetric time constants
             # Now supports -1 (reverse) to +1 (forward)
             if thr_cmd[i] > thr_level[i]:
@@ -2835,6 +4085,9 @@ def main():
                 ramp_tau = THRUSTER_TAU_DN  # default
             thr_level[i] += (DT / max(1e-6, ramp_tau)) * (thr_cmd[i] - thr_level[i])
             thr_level[i] = clamp(thr_level[i], -1.0, 1.0)  # Allow negative (reverse)
+            # Flush tiny residual values to exactly 0.0 to avoid stuck negative indicator colors
+            if abs(thr_level[i]) < 1e-4:
+                thr_level[i] = 0.0
             if abs(thr_level[i]) <= 1e-4:
                 continue
 
@@ -2846,21 +4099,17 @@ def main():
 
             # Simple empirical thrust loss due to inflow: reduce thrust as the
             # local inflow speed along the propeller axis increases.
-            # Use body-frame velocity and thruster direction (which is stored in body frame).
             dir_body = t.get("dir", (1.0, 0.0, 0.0))
-            # speed along prop axis (positive = flow in same direction)
             speed_along = v_body_for_thr[0]*dir_body[0] + v_body_for_thr[1]*dir_body[1] + v_body_for_thr[2]*dir_body[2]
             loss = THRUSTER_SPEED_LOSS_COEF * abs(speed_along)
-            loss = clamp(loss, 0.0, 0.9)  # don't zero-out thrust fully
+            loss = clamp(loss, 0.0, 0.9)
             thrust *= (1.0 - loss)
 
-            # Track thruster efficiency (actual output / max possible)
             _thr_efficiency[i] = abs(thrust) / max(0.01, thrust_max) if abs(thr_level[i]) > 1e-3 else 0.0
 
             dir_world = p.rotateVector(base_quat, t["dir"])
             force = (dir_world[0] * thrust, dir_world[1] * thrust, dir_world[2] * thrust)
 
-            # Accumulate net thruster force/torque (about COM) for debug
             F_thr_total = (F_thr_total[0] + force[0], F_thr_total[1] + force[1], F_thr_total[2] + force[2])
             rel_pos_world = p.rotateVector(base_quat, t["pos"])
             torque_thr = vcross(rel_pos_world, force)
@@ -2870,6 +4119,39 @@ def main():
                          base_pos[2] + rel_pos_world[2])
 
             p.applyExternalForce(rov, -1, force, world_pos, p.WORLD_FRAME)
+
+        # ── Debug force vector visualization ──────────────────────
+        if SHOW_FORCE_VECTORS and (sim_step % vis_every) == 0:
+            _fv_scale = FORCE_VECTOR_SCALE
+            # Thrust total (orange)
+            _fv_tip = (base_pos[0] + F_thr_total[0] * _fv_scale,
+                       base_pos[1] + F_thr_total[1] * _fv_scale,
+                       base_pos[2] + F_thr_total[2] * _fv_scale)
+            _force_viz_ids["thrust"] = p.addUserDebugLine(
+                list(base_pos), list(_fv_tip), [1.0, 0.6, 0.1], 3, lifeTime=0,
+                replaceItemUniqueId=_force_viz_ids.get("thrust", -1))
+            # Drag (blue)
+            _fv_tip_d = (base_pos[0] + F_drag[0] * _fv_scale,
+                         base_pos[1] + F_drag[1] * _fv_scale,
+                         base_pos[2] + F_drag[2] * _fv_scale)
+            _force_viz_ids["drag"] = p.addUserDebugLine(
+                list(base_pos), list(_fv_tip_d), [0.2, 0.5, 1.0], 2, lifeTime=0,
+                replaceItemUniqueId=_force_viz_ids.get("drag", -1))
+            # Buoyancy (green, from COB)
+            _buoy_tip = (cob_world[0], cob_world[1], cob_world[2] + buoy_force * _fv_scale)
+            _force_viz_ids["buoy"] = p.addUserDebugLine(
+                list(cob_world), list(_buoy_tip), [0.1, 0.9, 0.3], 2, lifeTime=0,
+                replaceItemUniqueId=_force_viz_ids.get("buoy", -1))
+            # Current direction (cyan arrow from ROV centre)
+            _cur_mag = math.sqrt(WATER_CURRENT_WORLD[0]**2 + WATER_CURRENT_WORLD[1]**2 + WATER_CURRENT_WORLD[2]**2)
+            if _cur_mag > 1e-4:
+                _cur_sc = 3.0  # scale up current vectors for visibility
+                _cur_tip = (base_pos[0] + WATER_CURRENT_WORLD[0] * _cur_sc,
+                            base_pos[1] + WATER_CURRENT_WORLD[1] * _cur_sc,
+                            base_pos[2] + WATER_CURRENT_WORLD[2] * _cur_sc)
+                _force_viz_ids["current"] = p.addUserDebugLine(
+                    list(base_pos), list(_cur_tip), [0.0, 0.8, 0.8], 1, lifeTime=0,
+                    replaceItemUniqueId=_force_viz_ids.get("current", -1))
 
         # Structured, per-step physics logging (CSV-like) to help tuning/optimization
         if LOG_PHYSICS_DETAILED and log_phys_every > 0 and (sim_step % log_phys_every) == 0 and _log_file_handle is not None:
@@ -2903,11 +4185,11 @@ def main():
                         opos, _ = p.getBasePositionAndOrientation(oid)
                         ovel, _ = p.getBaseVelocity(oid)
                         obs_csv += f",{opos[0]:.4f},{opos[1]:.4f},{opos[2]:.4f},{ovel[0]:.4f},{ovel[1]:.4f},{ovel[2]:.4f}"
-                    except Exception:
+                    except pybullet.error:
                         obs_csv += ",,,,,,"
                 line += obs_csv + "\n"
                 _log_file_handle.write(line)
-            except Exception:
+            except OSError:
                 # Keep logging best-effort; never crash sim for logging errors
                 pass
 
@@ -2963,6 +4245,14 @@ def main():
                 warning_flags.append("🔴 PROXIMITY")
             if _emergency_surface_active:
                 warning_flags.append("🆘 EMERGENCY SURFACE")
+            if DEPTH_HOLD_ENABLED:
+                warning_flags.append(f"DH:{DEPTH_HOLD_TARGET:.1f}m f={_depth_hold_force:+.1f}N")
+            if HEADING_HOLD_ENABLED:
+                warning_flags.append(f"HH:{math.degrees(HEADING_HOLD_TARGET):.0f}° τ={_heading_hold_torque:+.2f}")
+            if THRUSTER_FAILURE_ENABLED:
+                _fail_str = " ".join([f"T{j+1}:FAIL" for j in range(len(THRUSTER_FAILED)) if THRUSTER_FAILED[j]])
+                if _fail_str:
+                    warning_flags.append(f"💥 {_fail_str}")
             
             if warning_flags:
                 print(f"│ {' | '.join(warning_flags)}")
@@ -2976,7 +4266,7 @@ def main():
                         marker = "🎯" if oi == obs_idx else "  "
                         print(f"│ {marker} Obs[{oi+1}/{len(obstacles)}]: pos=({o_pos[0]:+.2f},{o_pos[1]:+.2f},{o_pos[2]:+.2f}) "
                               f"v=({o_lin[0]:+.2f},{o_lin[1]:+.2f},{o_lin[2]:+.2f}) |v|={o_spd:.3f}")
-                    except Exception:
+                    except pybullet.error:
                         pass
             
             print(f"└────────────────────────────────────────────────────────────────────┘")
@@ -3004,6 +4294,19 @@ def main():
                 f"Power: {THRUST_LEVEL*100:.0f}%  {thr_str}",
                 f"RPY: {math.degrees(roll_h):+.1f}  {math.degrees(pitch_h):+.1f}  {math.degrees(yaw_h):+.1f}",
             ]
+            # Assist mode status
+            _assists = []
+            if DEPTH_HOLD_ENABLED:
+                _assists.append(f"DH:{DEPTH_HOLD_TARGET:.1f}m")
+            if HEADING_HOLD_ENABLED:
+                _holds_hdg = math.degrees(HEADING_HOLD_TARGET) if HEADING_HOLD_TARGET else 0
+                _assists.append(f"HH:{_holds_hdg:.0f}deg")
+            if THRUSTER_FAILURE_ENABLED:
+                _failed_list = [f"T{j+1}" for j in range(len(THRUSTER_FAILED)) if THRUSTER_FAILED[j]]
+                if _failed_list:
+                    _assists.append(f"FAIL:{','.join(_failed_list)}")
+            if _assists:
+                hud_lines.append(" ".join(_assists))
             hud_text = "\n".join(hud_lines)
 
             # Position near ROV in world space (offset above and to the side)
@@ -3020,7 +4323,7 @@ def main():
                     hud_text, hud_pos,
                     textColorRGB=[1.0, 1.0, 1.0], textSize=1.1, lifeTime=0,
                     replaceItemUniqueId=hud_items["combined"])
-            except Exception:
+            except pybullet.error:
                 pass
 
         sim_step += 1
@@ -3028,6 +4331,21 @@ def main():
         if not p.isConnected():
             break
         p.stepSimulation()
+
+        # ── Timing metrics ───────────────────────────────────────
+        _timing_frame_count += 1
+        _timing_now = time.monotonic()
+        if SHOW_TIMING_METRICS and (_timing_now - _timing_last_report) >= TIMING_REPORT_INTERVAL:
+            _elapsed = _timing_now - _timing_last_report
+            _fps = _timing_frame_count / max(0.001, _elapsed)
+            _step_ms = (_elapsed / max(1, _timing_frame_count)) * 1000.0
+            _realtime_ratio = (_timing_frame_count * DT) / max(0.001, _elapsed)
+            print(f"[PERF] {_fps:.1f} FPS | step {_step_ms:.2f}ms | "
+                  f"realtime x{_realtime_ratio:.2f} | "
+                  f"sim {sim_step * DT:.1f}s")
+            _timing_frame_count = 0
+            _timing_last_report = _timing_now
+
         # Real-time pacing: sleep only the remaining time after computation
         if SLEEP_REALTIME:
             _wall_elapsed = time.monotonic() - _wall_t0
@@ -3041,42 +4359,10 @@ def main():
             if _log_file_handle is not None:
                 try:
                     _log_file_handle.flush()
-                except Exception:
+                except OSError:
                     pass
 
-    # Finalize any active recording before shutdown
-    if _rec_active and _rec_writer is not None:
-        try:
-            _rec_writer.release()
-            _dur = _rec_frame_count / max(1, REC_FPS)
-            print(f"[REC] ⏹  Recording saved on exit: {_rec_path}")
-            print(f"[REC]    {_rec_frame_count} frames, ~{_dur:.1f}s duration")
-        except Exception:
-            pass
-        _rec_writer = None
-        _rec_active = False
-
-    try:
-        p.disconnect()
-    except Exception:
-        pass
-    
-    # Close joystick panel
-    if ENABLE_JOYSTICK_PANEL and HAS_JOYSTICK:
-        try:
-            joystick_panel.stop_joystick_panel()
-        except Exception:
-            pass
-
-    # Close log file
-    if _log_file_handle is not None:
-        try:
-            _log_file_handle.write("\n" + "=" * 80 + "\n")
-            _log_file_handle.write(f"Simulation ended at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            _log_file_handle.close()
-            print(f"✅ Log saved to: {LOG_FILE}")
-        except Exception:
-            pass
+    teardown_simulation(_rec_active, _rec_writer, _rec_frame_count, _rec_path)
 
 
 if __name__ == "__main__":
@@ -3093,6 +4379,6 @@ if __name__ == "__main__":
         # Ensure PyBullet is disconnected on any exit path
         try:
             p.disconnect()
-        except Exception:
+        except pybullet.error:
             pass
     print("Simulator exited.")

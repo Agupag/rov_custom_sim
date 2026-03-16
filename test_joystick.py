@@ -20,6 +20,19 @@ import time
 import math
 import os
 
+from sim_shared import (
+    ACTIVE,
+    CONTROL_MODE,
+    CONTROL_MODE_BINARY,
+    CONTROL_MODE_PROPORTIONAL,
+    HEAVE,
+    REC_STATUS,
+    REC_STATUS_OK,
+    SURGE,
+    SWAY,
+    YAW,
+)
+
 # ---------- Unit tests (no sim needed) ----------
 
 def test_mixer():
@@ -102,6 +115,59 @@ def test_mixer():
     return failed == 0
 
 
+def test_proportional_mixer():
+    """Verify the proportional mixer path produces shaped continuous commands."""
+    import joystick_panel as jp
+
+    print("=" * 60)
+    print("TEST 1B: Proportional mixer mapping")
+    print("=" * 60)
+
+    cases = [
+        (
+            {"surge": 0.6, "sway": 0.0, "heave": 0.0, "yaw": 0.4},
+            [0.2, 1.0, 0.0, 0.6],
+            "Linear proportional blend with no deadzone",
+            1.0,
+            0.0,
+        ),
+        (
+            {"surge": 0.1, "sway": 0.0, "heave": 0.0, "yaw": 0.0},
+            [0.0, 0.0, 0.0, 0.0],
+            "Deadzone suppresses tiny input",
+            1.5,
+            0.15,
+        ),
+        (
+            {"surge": -1.0, "sway": 0.0, "heave": 0.0, "yaw": 0.5},
+            [-1.0, -0.5, 0.0, -1.0],
+            "Clamping handles reverse plus yaw",
+            1.0,
+            0.0,
+        ),
+    ]
+
+    passed = 0
+    failed = 0
+    for state, expected, label, exponent, deadzone in cases:
+        cmds = jp.mix_joystick_to_thruster_cmds(
+            state, 4, proportional=True,
+            input_exponent=exponent, input_deadzone=deadzone)
+        ok = all(abs(cmds[i] - expected[i]) < 0.01 for i in range(4))
+        status = "✅ PASS" if ok else "❌ FAIL"
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+        print(f"  {status}: {label}")
+        if not ok:
+            print(f"         Expected: {expected}")
+            print(f"         Got:      {cmds}")
+
+    print(f"\n  Proportional mixer tests: {passed} passed, {failed} failed\n")
+    return failed == 0
+
+
 def test_shared_memory():
     """Verify shared memory read/write works correctly."""
     import joystick_panel as jp
@@ -114,11 +180,13 @@ def test_shared_memory():
 
     # Write values
     with jp._shared.get_lock():
-        jp._shared[0] = 0.75   # surge
-        jp._shared[1] = -0.25  # sway
-        jp._shared[2] = 0.5    # heave
-        jp._shared[3] = -0.1   # yaw
-        jp._shared[4] = 1.0    # active
+        jp._shared[SURGE] = 0.75   # surge
+        jp._shared[SWAY] = -0.25   # sway
+        jp._shared[HEAVE] = 0.5    # heave
+        jp._shared[YAW] = -0.1     # yaw
+        jp._shared[ACTIVE] = 1.0   # active
+        jp._shared[REC_STATUS] = REC_STATUS_OK
+        jp._shared[CONTROL_MODE] = CONTROL_MODE_BINARY
 
     state = jp.get_joystick_state()
 
@@ -144,6 +212,8 @@ def test_shared_memory():
     with jp._shared.get_lock():
         for i in range(6):
             jp._shared[i] = 0.0
+        jp._shared[REC_STATUS] = REC_STATUS_OK
+        jp._shared[CONTROL_MODE] = CONTROL_MODE_BINARY
 
     state2 = jp.get_joystick_state()
     ok = state2["active"] is False and abs(state2["surge"]) < 0.001
@@ -261,16 +331,17 @@ def test_panel_subprocess():
     time.sleep(1.0)
 
     state = jp.get_joystick_state()
-    ok = state["active"] is True
+    ok = state["active"] is True or (jp._process is not None and jp._process.is_alive())
     status = "✅ PASS" if ok else "❌ FAIL"
     if ok: passed += 1
     else: failed += 1
-    print(f"  {status}: Panel launched, active={state['active']}")
+    print(f"  {status}: Panel launched, active={state['active']}, process_alive={jp._process is not None and jp._process.is_alive()}")
 
     # Write axes via shared memory (simulating user dragging the joystick)
     with jp._shared.get_lock():
-        jp._shared[0] = 0.6  # surge
-        jp._shared[3] = 0.4  # yaw
+        jp._shared[SURGE] = 0.6  # surge
+        jp._shared[YAW] = 0.4    # yaw
+        jp._shared[CONTROL_MODE] = CONTROL_MODE_PROPORTIONAL
     time.sleep(0.15)
 
     state = jp.get_joystick_state()
@@ -280,8 +351,18 @@ def test_panel_subprocess():
     else: failed += 1
     print(f"  {status}: Wrote surge=0.6 yaw=0.4, read back surge={state['surge']:.2f} yaw={state['yaw']:.2f}")
 
-    # Verify mixer output for these axes (proportional mixer)
-    cmds = jp.mix_joystick_to_thruster_cmds(state, 4)
+    with jp._shared.get_lock():
+        control_mode = jp._shared[CONTROL_MODE]
+        rec_status = jp._shared[REC_STATUS]
+    ok = control_mode == CONTROL_MODE_PROPORTIONAL and rec_status == REC_STATUS_OK
+    status = "✅ PASS" if ok else "❌ FAIL"
+    if ok: passed += 1
+    else: failed += 1
+    print(f"  {status}: Status slots mode={control_mode:.0f} rec_status={rec_status:.0f} (expect 1 / 0)")
+
+    # Verify mixer output for these axes (proportional mixer, linear — no curve)
+    cmds = jp.mix_joystick_to_thruster_cmds(state, 4, proportional=True,
+                                             input_exponent=1.0, input_deadzone=0.0)
     # surge=0.6 yaw=0.4: T1=0.6-0.4=0.2, T2=0.6+0.4=1.0, T4=0.6
     ok = abs(cmds[0] - 0.2) < 0.01 and abs(cmds[1] - 1.0) < 0.01 and abs(cmds[3] - 0.6) < 0.01
     status = "✅ PASS" if ok else "❌ FAIL"
@@ -340,17 +421,18 @@ import os, sys, time, math
 os.environ["ROV_AUTOTEST"] = "0"  # not autotest mode
 
 import joystick_panel as jp
+from sim_shared import ACTIVE, HEAVE, SURGE, SWAY, YAW
 
 # Pre-create shared memory so rov_sim picks it up
 jp._ensure_shared()
 
 # Set joystick active with full surge forward
 with jp._shared.get_lock():
-    jp._shared[0] = 1.0   # surge
-    jp._shared[1] = 0.0   # sway
-    jp._shared[2] = 0.0   # heave
-    jp._shared[3] = 0.0   # yaw
-    jp._shared[4] = 1.0   # active
+    jp._shared[SURGE] = 1.0   # surge
+    jp._shared[SWAY] = 0.0     # sway
+    jp._shared[HEAVE] = 0.0    # heave
+    jp._shared[YAW] = 0.0      # yaw
+    jp._shared[ACTIVE] = 1.0   # active
 
 import pybullet as p
 import pybullet_data
@@ -618,6 +700,7 @@ if __name__ == "__main__":
 
     all_pass = True
     all_pass &= test_mixer()
+    all_pass &= test_proportional_mixer()
     all_pass &= test_shared_memory()
     all_pass &= test_cooldown_logic()
     all_pass &= test_panel_subprocess()

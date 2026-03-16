@@ -1,0 +1,44 @@
+# ── Runtime outputs ───────────────────────────────────────────────
+rov_sim_log_*.txt
+diag_physics.log
+*.mp4
+
+# ── Generated calibration/diagnostic artifacts ────────────────────
+# (regenerated on demand via tools/run_validation_and_calibration.py)
+extended_diagnostics_results.json
+extended_diagnostics_candidate_*.json
+tools/sensitivity_sweep_results.json
+tools/sensitivity_sweep_results.csv
+tools/sensitivity_recommendation*.json
+tools/sensitivity_recommendation*.md
+tools/validation_pipeline_summary.json
+IMPLEMENTATION_SUMMARY_DIAGNOSTICS.md
+
+# ── Python bytecode ───────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ── Virtual environments ──────────────────────────────────────────
+pyb_env/
+pybullet_env/
+pybullet_env_312/
+.venv/
+venv/
+env/
+
+# ── macOS metadata ────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+
+# ── Build outputs ────────────────────────────────────────────────
+build/
+dist/
+*.spec.log
+
+# ── Editor / IDE ─────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*~
