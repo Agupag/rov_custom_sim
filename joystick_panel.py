@@ -802,7 +802,23 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
             pass
 
     def _new_check(parent, text, var):
-        return ttk.Checkbutton(parent, text=text, variable=var, command=_publish_settings_to_shared)
+        return tk.Checkbutton(
+            parent,
+            text=text,
+            variable=var,
+            command=_publish_settings_to_shared,
+            bg="#1c2130",
+            fg="#d8e2ff",
+            selectcolor="#2b3450",
+            activebackground="#252d45",
+            activeforeground="#ffffff",
+            highlightthickness=0,
+            bd=0,
+            anchor="w",
+            padx=8,
+            pady=6,
+            font=("Helvetica", 11),
+        )
 
     def _open_settings_window():
         w = _settings_state["win"]
@@ -814,59 +830,187 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
         w = tk.Toplevel(root)
         _settings_state["win"] = w
         w.title("ROV Settings")
-        w.geometry("390x470+770+90")
-        w.resizable(False, False)
-        w.configure(bg="#171921")
-
+        w.geometry("470x560+760+80")
+        w.resizable(True, True)
+        w.configure(bg="#0f1320")
         style = ttk.Style(w)
-        style.configure("Panel.TFrame", background="#171921")
-        style.configure("Card.TLabelframe", background="#1f2230", foreground="#d8e0ef")
-        style.configure("Card.TLabelframe.Label", background="#1f2230", foreground="#d8e0ef")
-        style.configure("Panel.TLabel", background="#171921", foreground="#a9b6d3")
 
-        outer = ttk.Frame(w, style="Panel.TFrame", padding=12)
-        outer.pack(fill="both", expand=True)
+        scroll_host = tk.Frame(w, bg="#0f1320")
+        scroll_host.pack(fill="both", expand=True)
 
-        title = tk.Label(outer, text="Runtime Controls", bg="#171921", fg="#dce6ff",
-                         font=("Helvetica", 13, "bold"))
-        title.pack(anchor="w")
-        subtitle = tk.Label(outer, text="All simulator settings are controlled from this panel.",
-                            bg="#171921", fg="#8ea0c7", font=("Helvetica", 9))
-        subtitle.pack(anchor="w", pady=(0, 8))
+        scroll_canvas = tk.Canvas(
+            scroll_host,
+            background="#0f1320",
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        scroll_canvas.pack(side="left", fill="both", expand=True)
 
-        prop_frame = ttk.LabelFrame(outer, text="Propulsion", style="Card.TLabelframe", padding=10)
-        prop_frame.pack(fill="x", pady=(0, 8))
-        tk.Label(prop_frame, text="Thrust Level", bg="#1f2230", fg="#d7e0f2",
-                 font=("Helvetica", 10, "bold")).pack(anchor="w")
-        thrust_scale = ttk.Scale(prop_frame, from_=0.1, to=1.0, variable=_set_thrust_var,
-                                 command=lambda _v: _publish_settings_to_shared())
-        thrust_scale.pack(fill="x", pady=(6, 2))
-        _thrust_label = tk.Label(prop_frame, text="100%", bg="#1f2230", fg="#7fd5ff", font=("Courier", 9, "bold"))
-        _thrust_label.pack(anchor="e")
-        _new_check(prop_frame, "Proportional Joystick Mode", _set_prop_var).pack(anchor="w", pady=(6, 0))
-        _new_check(prop_frame, "Emergency Surface", _set_emergency_var).pack(anchor="w", pady=(4, 0))
+        # Some Tk builds (notably macOS/Aqua variants) reject certain color options
+        # on classic Scrollbar widgets. Keep this path conservative for reliability.
+        scroll_bar = ttk.Scrollbar(scroll_host, orient="vertical", command=scroll_canvas.yview)
+        scroll_bar.pack(side="right", fill="y")
+        scroll_canvas.configure(yscrollcommand=scroll_bar.set)
 
-        assist_frame = ttk.LabelFrame(outer, text="Assist", style="Card.TLabelframe", padding=10)
-        assist_frame.pack(fill="x", pady=(0, 8))
-        _new_check(assist_frame, "Depth Hold", _set_depth_hold_var).pack(anchor="w")
-        _new_check(assist_frame, "Heading Hold", _set_heading_hold_var).pack(anchor="w", pady=(4, 0))
+        outer = tk.Frame(scroll_canvas, bg="#0f1320")
+        outer_win = scroll_canvas.create_window((0, 0), window=outer, anchor="nw")
 
-        cam_frame = ttk.LabelFrame(outer, text="Camera", style="Card.TLabelframe", padding=10)
-        cam_frame.pack(fill="x", pady=(0, 8))
-        _new_check(cam_frame, "Follow ROV", _set_cam_follow_var).pack(anchor="w")
-        _new_check(cam_frame, "Chase Camera", _set_cam_chase_var).pack(anchor="w", pady=(4, 0))
-        _new_check(cam_frame, "Top-Down View", _set_topdown_var).pack(anchor="w", pady=(4, 0))
+        def _sync_scroll_region(_event=None):
+            scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all"))
 
-        diag_frame = ttk.LabelFrame(outer, text="Diagnostics", style="Card.TLabelframe", padding=10)
-        diag_frame.pack(fill="x", pady=(0, 8))
-        _new_check(diag_frame, "Show Force Vectors", _set_force_viz_var).pack(anchor="w")
-        _new_check(diag_frame, "Thruster Failure Simulation", _set_thr_fail_var).pack(anchor="w", pady=(4, 0))
-        _new_check(diag_frame, "Trail Rendering", _set_trail_var).pack(anchor="w", pady=(4, 0))
+        def _sync_inner_width(event):
+            scroll_canvas.itemconfigure(outer_win, width=event.width)
 
-        action_row = ttk.Frame(outer, style="Panel.TFrame")
-        action_row.pack(fill="x", pady=(4, 0))
-        ttk.Button(action_row, text="Reset ROV", command=_send_reset_command).pack(side="left")
-        ttk.Button(action_row, text="Close", command=w.destroy).pack(side="right")
+        outer.bind("<Configure>", _sync_scroll_region)
+        scroll_canvas.bind("<Configure>", _sync_inner_width)
+
+        def _settings_on_wheel(event):
+            if getattr(event, "num", None) == 4:
+                scroll_canvas.yview_scroll(-1, "units")
+                return "break"
+            if getattr(event, "num", None) == 5:
+                scroll_canvas.yview_scroll(1, "units")
+                return "break"
+
+            delta = getattr(event, "delta", 0)
+            if delta:
+                units = -1 if delta > 0 else 1
+                scroll_canvas.yview_scroll(units, "units")
+                return "break"
+            return None
+
+        def _bind_settings_wheel(_event=None):
+            scroll_canvas.bind_all("<MouseWheel>", _settings_on_wheel)
+            scroll_canvas.bind_all("<Button-4>", _settings_on_wheel)
+            scroll_canvas.bind_all("<Button-5>", _settings_on_wheel)
+
+        def _unbind_settings_wheel(_event=None):
+            scroll_canvas.unbind_all("<MouseWheel>")
+            scroll_canvas.unbind_all("<Button-4>")
+            scroll_canvas.unbind_all("<Button-5>")
+
+        scroll_canvas.bind("<Enter>", _bind_settings_wheel)
+        scroll_canvas.bind("<Leave>", _unbind_settings_wheel)
+        w.bind("<Destroy>", _unbind_settings_wheel)
+
+        top_pad = tk.Frame(outer, bg="#0f1320", height=12)
+        top_pad.pack(fill="x")
+
+        hero = tk.Frame(outer, bg="#161d31", bd=0, highlightthickness=1, highlightbackground="#2b3756")
+        hero.pack(fill="x", padx=14, pady=(0, 12))
+        tk.Label(
+            hero,
+            text="ROV Runtime Console",
+            bg="#161d31",
+            fg="#e6eeff",
+            font=("Helvetica", 16, "bold"),
+            anchor="w",
+            padx=14,
+            pady=12,
+        ).pack(fill="x")
+        tk.Label(
+            hero,
+            text="Tune propulsion, assists, camera, and diagnostics live.",
+            bg="#161d31",
+            fg="#9db0da",
+            font=("Helvetica", 10),
+            anchor="w",
+            padx=14,
+            pady=(0, 12),
+        ).pack(fill="x")
+
+        def _section(title_text):
+            frame = tk.Frame(outer, bg="#1c2130", bd=0, highlightthickness=1, highlightbackground="#2a334b")
+            frame.pack(fill="x", padx=14, pady=(0, 10))
+            tk.Label(
+                frame,
+                text=title_text,
+                bg="#1c2130",
+                fg="#c8d8ff",
+                font=("Helvetica", 12, "bold"),
+                anchor="w",
+                padx=12,
+                pady=10,
+            ).pack(fill="x")
+            body = tk.Frame(frame, bg="#1c2130")
+            body.pack(fill="x", padx=10, pady=(0, 10))
+            return body
+
+        prop_frame = _section("Propulsion")
+        tk.Label(
+            prop_frame,
+            text="Thrust Level",
+            bg="#1c2130",
+            fg="#dbe6ff",
+            font=("Helvetica", 10, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 4))
+        style.configure("Thrust.Horizontal.TScale", troughcolor="#2a334b", background="#1c2130")
+        thrust_scale = ttk.Scale(
+            prop_frame,
+            from_=0.1,
+            to=1.0,
+            variable=_set_thrust_var,
+            command=lambda _v: _publish_settings_to_shared(),
+            style="Thrust.Horizontal.TScale",
+        )
+        thrust_scale.pack(fill="x")
+        _thrust_label = tk.Label(
+            prop_frame,
+            text="100%",
+            bg="#1c2130",
+            fg="#67d2ff",
+            font=("Courier", 11, "bold"),
+            anchor="e",
+        )
+        _thrust_label.pack(fill="x", pady=(2, 6))
+        _new_check(prop_frame, "Proportional Joystick Mode", _set_prop_var).pack(fill="x", pady=(2, 0))
+        _new_check(prop_frame, "Emergency Surface", _set_emergency_var).pack(fill="x", pady=(2, 0))
+
+        assist_frame = _section("Assist")
+        _new_check(assist_frame, "Depth Hold", _set_depth_hold_var).pack(fill="x", pady=(2, 0))
+        _new_check(assist_frame, "Heading Hold", _set_heading_hold_var).pack(fill="x", pady=(2, 0))
+
+        cam_frame = _section("Camera")
+        _new_check(cam_frame, "Follow ROV", _set_cam_follow_var).pack(fill="x", pady=(2, 0))
+        _new_check(cam_frame, "Chase Camera", _set_cam_chase_var).pack(fill="x", pady=(2, 0))
+        _new_check(cam_frame, "Top-Down View", _set_topdown_var).pack(fill="x", pady=(2, 0))
+
+        diag_frame = _section("Diagnostics")
+        _new_check(diag_frame, "Show Force Vectors", _set_force_viz_var).pack(fill="x", pady=(2, 0))
+        _new_check(diag_frame, "Thruster Failure Simulation", _set_thr_fail_var).pack(fill="x", pady=(2, 0))
+        _new_check(diag_frame, "Trail Rendering", _set_trail_var).pack(fill="x", pady=(2, 0))
+
+        action_row = tk.Frame(outer, bg="#0f1320")
+        action_row.pack(fill="x", padx=14, pady=(0, 14))
+        tk.Button(
+            action_row,
+            text="Reset ROV",
+            command=_send_reset_command,
+            bg="#2f6aa0",
+            fg="#f0f6ff",
+            activebackground="#4485c3",
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=8,
+            font=("Helvetica", 10, "bold"),
+        ).pack(side="left")
+        tk.Button(
+            action_row,
+            text="Close",
+            command=w.destroy,
+            bg="#30364a",
+            fg="#e3e9fb",
+            activebackground="#48506a",
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=8,
+            font=("Helvetica", 10, "bold"),
+        ).pack(side="right")
 
         def _update_settings_labels():
             _thrust_label.config(text=f"{int(round(_set_thrust_var.get() * 100.0)):d}%")
@@ -897,7 +1041,10 @@ def _panel_main(shared_arr, frame_buf, frame_seq, panel_buf, panel_seq):
         sy1 = _SET_CY - _SET_BTN_H // 2
         sy2 = _SET_CY + _SET_BTN_H // 2
         if _in_rect(mx, my, sx1, sy1, sx2, sy2):
-            _open_settings_window()
+            try:
+                _open_settings_window()
+            except Exception as e:
+                print(f"[SETTINGS] Failed to open settings window: {e}")
             return True
         return False
 

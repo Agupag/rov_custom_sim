@@ -12,6 +12,7 @@ try:
     import cv2  # optional (used for camera preview window)
 except ImportError:
     cv2 = None
+HAS_CV2 = cv2 is not None
 
 try:
     import numpy as np
@@ -20,10 +21,18 @@ except ImportError:
     HAS_NUMPY = False
 
 try:
+    from PIL import ImageGrab  # optional (used for panel capture while recording)
+    HAS_PIL = True
+except ImportError:
+    ImageGrab = None
+    HAS_PIL = False
+
+try:
     from debug.runtime_events import RuntimeEventLogger
 except ImportError:
     RuntimeEventLogger = None
 
+import pybullet
 import pybullet as p
 import pybullet_data
 
@@ -222,7 +231,8 @@ AREA = [0.0929, 0.0929, 0.1238]       # m² — measured from CAD per DDR
 # from frame struts, housings, etc. Ensures the ROV stops at low speeds
 # where quadratic drag alone is negligible.
 # Fossen (Sec 8.4.2): D_linear = diag(X_u, Y_v, Z_w, K_p, M_q, N_r)
-LIN_DRAG_BODY = (4.8, 5.0, 6.0)       # translational (N per m/s)
+# From tools/sensitivity_recommendation_agility_candidate.json: lin_drag_body_x_1.2x
+LIN_DRAG_BODY = (5.76, 5.0, 6.0)      # translational (N per m/s)
 LIN_DRAG_ANG  = (2.5, 2.5, 2.0)       # rotational   (N·m per rad/s)
 
 # Quadratic (nonlinear) damping: D_nonlin · |ν| · ν
@@ -1419,7 +1429,11 @@ def choose_thruster_config():
             return name
         return ACTIVE_CONFIG_NAME
 
-    import tkinter as tk
+    try:
+        import tkinter as tk
+    except ImportError as e:
+        print(f"⚠️  Tkinter unavailable for configuration selector: {e}")
+        return None
 
     # ── Pre-analyse each configuration (with exception protection) ────────────────────────────
     config_info = {}
@@ -1464,7 +1478,7 @@ def choose_thruster_config():
                 "n_v":           len([t for t in thrusters if t["kind"] == "V"]),
                 "description":   desc,
             }
-        except (ValueError, KeyError, pybullet.error) as e:
+        except Exception as e:
             print(f"⚠️  Pre-analysis of '{name}' failed: {e} — skipping from selector")
             config_info[name] = None  # Mark as failed to skip rendering
 
@@ -1477,10 +1491,18 @@ def choose_thruster_config():
     if not primary_configs:
         primary_configs = [(name, cfg) for name, cfg in THRUSTER_CONFIGS.items() if config_info.get(name) is not None]
 
+    if not primary_configs:
+        print("⚠️  No valid configurations available for selector; using first configured pair")
+        return None
+
     chosen = [None]
 
     # ── Window ───────────────────────────────────────────────────
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except Exception as e:
+        print(f"⚠️  Could not open configuration selector window: {e}")
+        return None
     root.title("ROV Simulator \u2014 Thruster Configuration")
     root.configure(bg=C["bg"])
     root.resizable(False, False)
@@ -2696,7 +2718,7 @@ def main():
                 _evt("startup", "config_not_selected")
                 return
             _evt("startup", "config_selected", selected=ACTIVE_CONFIG_NAME, obj=OBJ_FILE, gltf=GLTF_FILE)
-        except (RuntimeError, ImportError) as e:
+        except Exception as e:
             print(f"⚠️  Tkinter selector crashed: {e}")
             print("[CONFIG] Using auto-fallback to first config.")
             _evt("startup", "config_selector_failed", error=str(e))
@@ -4424,7 +4446,14 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()  # Required for PyInstaller on Windows
     import traceback as _tb
     try:
-        main()
+        try:
+            main()
+        except Exception as e:
+            import traceback
+
+            print(f"[FATAL] Unhandled simulator exception: {e}")
+            traceback.print_exc()
+            raise
     except KeyboardInterrupt:
         print("\n[SIM] Interrupted by user (Ctrl+C). Exiting.")
     except Exception as _e:

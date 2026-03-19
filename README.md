@@ -7,12 +7,14 @@ This workspace contains a PyBullet-based underwater ROV simulator with a separat
 - `rov_sim.py`: main simulator and primary entrypoint
 - `joystick_panel.py`: controller UI process and joystick mixer
 - `Assembly 1.obj` / `Assembly 1.gltf` / `Assembly 1.mtl`: mesh and transform assets used by the simulator
+- `v1.*` / `v2.*` / `v3.*`: versioned CAD configs discovered through `THRUSTER_CONFIGS` auto-discovery at runtime
 - `test_*.py`: behavior-focused diagnostics for controls, thruster logic, and physics
 - `physics_analyzer.py`: post-run log parser for detailed physics logs
 - `physics_auto_optimizer.py`: heuristic analysis helper for log-driven tuning
 - `tools/tune_added_mass_and_thruster_loss.py`: offline tuning helper that inspects logs and current constants
 - `README_WINDOWS.md`: Windows build and distribution notes
 - `rov_sim.spec` / `build_windows_exe.bat`: PyInstaller packaging path for Windows
+- `rov_sim_backup.py`: legacy reference file kept for manual comparison only (not used by runtime)
 
 ## Architecture
 
