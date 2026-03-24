@@ -8,11 +8,29 @@ import struct
 import multiprocessing
 from datetime import datetime
 
-try:
-    import cv2  # optional (used for camera preview window)
-except ImportError:
-    cv2 = None
-HAS_CV2 = cv2 is not None
+cv2 = None  # loaded lazily; optional (used for camera preview/recording)
+HAS_CV2 = False
+_CV2_IMPORT_ERROR = None
+
+
+def _ensure_cv2():
+    """Attempt to import OpenCV once, only when camera/recording needs it."""
+    global cv2, HAS_CV2, _CV2_IMPORT_ERROR
+    if HAS_CV2:
+        return True
+    if _CV2_IMPORT_ERROR is not None:
+        return False
+    if os.environ.get("ROV_DISABLE_CV2", "0") == "1":
+        _CV2_IMPORT_ERROR = RuntimeError("cv2 import disabled by ROV_DISABLE_CV2=1")
+        return False
+    try:
+        import cv2 as _cv2  # optional dependency
+        cv2 = _cv2
+        HAS_CV2 = True
+        return True
+    except Exception as exc:
+        _CV2_IMPORT_ERROR = exc
+        return False
 
 try:
     import numpy as np
@@ -3784,7 +3802,7 @@ def main():
                     except (ValueError, OSError):
                         pass
                 # Also show in OpenCV window if available (fallback)
-                elif rgba_tinted is not None and cv2 is not None:
+                elif rgba_tinted is not None and _ensure_cv2():
                     frame = rgba_tinted[:, :, ::-1]
                     cv2.imshow("ROV Camera", frame)
                     cv2.waitKey(1)
@@ -3808,7 +3826,8 @@ def main():
 
         if _rec_want and not _rec_active:
             # --- START recording ---
-            if cv2 is None or not HAS_NUMPY:
+            _has_cv2 = _ensure_cv2()
+            if not _has_cv2 or not HAS_NUMPY:
                 print("[REC] ⚠️  Recording requires opencv-python and numpy. Install with:")
                 print("      pip install opencv-python numpy")
                 try:
@@ -3817,7 +3836,7 @@ def main():
                         joystick_panel._shared[REC_STATUS] = REC_STATUS_MISSING_DEPS
                 except (IndexError, ValueError, OSError):
                     pass
-                _evt("recording", "start_failed_missing_deps", has_cv2=cv2 is not None, has_numpy=HAS_NUMPY)
+                _evt("recording", "start_failed_missing_deps", has_cv2=_has_cv2, has_numpy=HAS_NUMPY)
             else:
                 try:
                     with joystick_panel._shared.get_lock():
@@ -3930,7 +3949,7 @@ def main():
                 _bgr = _composite[:, :, ::-1]
                 _rec_writer.write(_bgr)
                 _rec_frame_count += 1
-            except (ValueError, OSError, cv2.error) as _rec_err:
+            except Exception as _rec_err:
                 # Don't crash the sim if recording fails
                 if _rec_frame_count == 0:
                     print(f"[REC] ⚠️  Frame capture error: {_rec_err}")
